@@ -3,8 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.engine import Connection
 from unittest.mock import patch
 
+import api_gateway.db as db_module
 from api_gateway.app import create_app
 from api_gateway.config import Settings
 from api_gateway.db import init_db, reconfigure_db, session_scope
@@ -74,6 +77,60 @@ def test_idempotent_job_creation(tmp_path: Path):
         assert job1.id == job2.id
 
     assert len(queue.items) == 1
+
+
+def test_init_db_auto_falls_back_to_sqlite_when_postgres_unreachable(tmp_path: Path, monkeypatch):
+    fallback_db = tmp_path / "gateway-fallback.db"
+
+    monkeypatch.setenv("GATEWAY_ENV", "dev")
+    monkeypatch.setenv("GATEWAY_DB_AUTO_FALLBACK", "1")
+    monkeypatch.setenv("GATEWAY_SQLITE_FALLBACK_PATH", str(fallback_db))
+    monkeypatch.setenv("GATEWAY_DB_CONNECT_TIMEOUT_SEC", "1")
+
+    reconfigure_db("postgresql+psycopg://postgres:postgres@127.0.0.1:5432/anotherme2")
+
+    def _fake_create_all(*args, **kwargs):
+        bind = kwargs.get("bind")
+        engine_url = ""
+        if isinstance(bind, Connection):
+            engine_url = str(bind.engine.url)
+        elif bind is not None and hasattr(bind, "url"):
+            engine_url = str(bind.url)
+
+        if engine_url.startswith("postgresql"):
+            raise OperationalError(
+                "create_all",
+                {},
+                Exception("could not connect to server: Connection refused"),
+            )
+        return None
+
+    with patch.object(db_module, "_postgres_tcp_reachable", return_value=True), patch.object(
+        db_module.Base.metadata,
+        "create_all",
+        side_effect=_fake_create_all,
+    ):
+        init_db()
+
+    engine_url = str(db_module.engine.url)
+    assert engine_url.startswith("sqlite:///")
+    assert fallback_db.as_posix() in engine_url
+
+
+def test_init_db_precheck_fallback_initializes_sqlite_without_postgres_lock(tmp_path: Path, monkeypatch):
+    fallback_db = tmp_path / "gateway-precheck-fallback.db"
+
+    monkeypatch.setenv("GATEWAY_ENV", "dev")
+    monkeypatch.setenv("GATEWAY_DB_AUTO_FALLBACK", "1")
+    monkeypatch.setenv("GATEWAY_SQLITE_FALLBACK_PATH", str(fallback_db))
+
+    reconfigure_db("postgresql+psycopg://postgres:postgres@127.0.0.1:5432/anotherme2")
+
+    with patch.object(db_module, "_postgres_tcp_reachable", return_value=False):
+        init_db()
+
+    assert str(db_module.engine.url).startswith("sqlite:///")
+    assert fallback_db.exists()
 
 
 def test_api_contract_uploads_and_jobs(tmp_path: Path):

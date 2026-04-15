@@ -6,6 +6,8 @@
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .formal_video_validator import FormalVideoValidator
+
 
 class TemplateCodeGenerator:
     """使用 CoordinateScene + StepContexts 生成 Manim 代码。"""
@@ -15,6 +17,8 @@ class TemplateCodeGenerator:
         self.prefer_mathtex = bool(canvas_config.get("prefer_mathtex", False))
         self.formula_math_font_size = int(canvas_config.get("formula_math_font_size", 28))
         self.formula_text_font_size = int(canvas_config.get("formula_text_font_size", 28))
+        self.formula_max_visible_slots = int(canvas_config.get("formula_max_visible_slots", 6))
+        self.validator = FormalVideoValidator(canvas_config)
 
     def generate(
         self,
@@ -234,21 +238,49 @@ class TemplateCodeGenerator:
         code.append("")
 
         prev_scene = initial_scene
+        has_formula_group = False
+        formula_slot_history: List[Tuple[float, float, float, float]] = []
+        visible_formula_texts: Set[str] = set()
 
         for ctx in step_contexts:
             plan = ctx.get("animation_plan", {})
+            animation_spec = ctx.get("animation_spec", {}) if isinstance(ctx, dict) else {}
+            timing_budget = animation_spec.get("timing_budget", {}) if isinstance(animation_spec, dict) else {}
             step_id = int(plan.get("step_id", 0))
             title = self._safe_text(str(plan.get("title", f"步骤{step_id}")))
             title = self._safe_text(self._clean_display_text(title))
-            duration = self._safe_duration(plan.get("duration", 1.0), 1.0)
-            focus_entities = plan.get("focus_entities", []) or []
+            duration = self._safe_duration(
+                timing_budget.get("duration", plan.get("duration", 1.0)),
+                1.0,
+            )
+            focus_entities = animation_spec.get("focus_entities", plan.get("focus_entities", [])) or []
             action_types = {
                 str(a.get("type", ""))
                 for a in plan.get("actions", [])
                 if isinstance(a, dict)
             }
             layout = ctx.get("canvas_layout", {})
-            formula_elements = layout.get("reserved_formula_elements", []) or []
+            formula_elements = [
+                action.get("layout", action)
+                for action in (animation_spec.get("formula_actions", []) or [])
+                if isinstance(action, dict)
+            ] or (layout.get("reserved_formula_elements", []) or [])
+            emphasis_actions = [
+                item for item in (animation_spec.get("emphasis_actions", []) or [])
+                if isinstance(item, dict)
+            ]
+            movement_actions = [
+                item for item in (animation_spec.get("movement_actions", []) or [])
+                if isinstance(item, dict)
+            ]
+            label_actions = [
+                item for item in (animation_spec.get("label_actions", []) or [])
+                if isinstance(item, dict)
+            ]
+            restore_actions = [
+                item for item in (animation_spec.get("restore_actions", []) or [])
+                if isinstance(item, dict)
+            ]
 
             step = step_by_id.get(step_id)
             audio_file = ""
@@ -265,12 +297,46 @@ class TemplateCodeGenerator:
             used = 0.0
 
             if formula_elements:
-                code.append("        if len(current_formula_group) > 0:")
-                code.append("            self.play(FadeOut(current_formula_group), run_time=0.20)")
-                code.append("        current_formula_group = VGroup()")
-                used += 0.2
+                reset_formula_area = bool(animation_spec.get("reset_formula_area", False))
+                current_formula_slots = [
+                    (
+                        float(el.get("x", 0.7)),
+                        float(el.get("y", 0.2)),
+                        float(el.get("width", 0.25)),
+                        float(el.get("height", 0.12)),
+                    )
+                    for el in formula_elements
+                    if isinstance(el, dict)
+                ]
+                if (
+                    has_formula_group
+                    and not reset_formula_area
+                    and self.formula_max_visible_slots > 0
+                    and len(formula_slot_history) + len(current_formula_slots) > self.formula_max_visible_slots
+                ):
+                    reset_formula_area = True
+                # 上游即便漏传 reset 标记，也在 codegen 侧兜底避免文字/公式重叠。
+                if has_formula_group and not reset_formula_area:
+                    overlap_found = any(
+                        self._boxes_overlap(slot, old_slot)
+                        for slot in current_formula_slots
+                        for old_slot in formula_slot_history
+                    )
+                    if overlap_found:
+                        reset_formula_area = True
+                formula_reset_time = self._safe_duration(
+                    timing_budget.get("formula_reset", 0.20),
+                    0.20,
+                )
+                if reset_formula_area and has_formula_group:
+                    code.append("        if len(current_formula_group) > 0:")
+                    code.append(f"            self.play(FadeOut(current_formula_group), run_time={formula_reset_time:.2f})")
+                    used += formula_reset_time
+                    code.append("        current_formula_group = VGroup()")
+                    visible_formula_texts.clear()
 
                 code.append("        step_formula_group = VGroup()")
+                appended_formula_count = 0
                 for el in formula_elements:
                     raw_content = str(el.get("content", ""))
                     raw_content = self._clean_display_text(raw_content)
@@ -285,6 +351,11 @@ class TemplateCodeGenerator:
                     if line_label:
                         _, length_text = line_label
                         display_content = length_text
+                    normalized_display_content = re.sub(r"\s+", " ", display_content).strip()
+                    if not normalized_display_content:
+                        continue
+                    if has_formula_group and not reset_formula_area and normalized_display_content in visible_formula_texts:
+                        continue
                     code.append(f"        block_nx = {center_nx:.6f}")
                     code.append(f"        block_ny = {center_ny:.6f}")
                     code.append(f"        block_nw = {w:.6f}")
@@ -310,14 +381,35 @@ class TemplateCodeGenerator:
                     code.append("            formula_obj.scale_to_fit_height(max_height)")
                     code.append("        formula_obj.move_to(np.array([block_x, block_y, 0]))")
                     code.append("        step_formula_group.add(formula_obj)")
-                show_time = self._safe_duration(min(0.6, duration * 0.18), 0.15)
-                code.append(f"        self.play(FadeIn(step_formula_group), run_time={show_time:.2f})")
-                code.append("        current_formula_group = step_formula_group")
+                    visible_formula_texts.add(normalized_display_content)
+                    appended_formula_count += 1
+                if appended_formula_count == 0:
+                    code.append("        step_formula_group = VGroup()")
+                show_time = self._safe_duration(
+                    timing_budget.get("formula_show", min(1.0, duration * 0.25)),
+                    0.15,
+                )
+                code.append("        if len(step_formula_group) > 0:")
+                code.append(f"            self.play(FadeIn(step_formula_group), run_time={show_time:.2f})")
+                if has_formula_group and not reset_formula_area:
+                    code.append("            current_formula_group.add(*step_formula_group)")
+                else:
+                    code.append("            current_formula_group = step_formula_group")
+                if reset_formula_area:
+                    formula_slot_history = list(current_formula_slots)
+                else:
+                    formula_slot_history.extend(current_formula_slots)
                 used += show_time
+                has_formula_group = True
 
             current_scene = self._authoritative_step_scene(initial_scene, ctx)
             moved_points = self._extract_moved_points(prev_scene, current_scene)
-            if moved_points:
+            moved_point_ids = [
+                str(item.get("point_id", "")).strip()
+                for item in movement_actions
+                if str(item.get("point_id", "")).strip()
+            ] or list(moved_points.keys())
+            if moved_point_ids:
                 current_lookup = self._scene_points(current_scene)
                 current_bbox = self._coordinate_bbox(current_lookup)
                 current_screen_points = self._screen_point_map(
@@ -328,9 +420,12 @@ class TemplateCodeGenerator:
                     left_panel_x_max,
                     safe_margin,
                 )
-                move_time = self._safe_duration(min(0.8, duration * 0.3), 0.2)
+                move_time = self._safe_duration(
+                    timing_budget.get("movement", min(0.8, duration * 0.3)),
+                    0.2,
+                )
                 code.append("        move_anims = []")
-                for point_id in moved_points:
+                for point_id in moved_point_ids:
                     sx, sy = current_screen_points.get(point_id, (0.0, 0.0))
                     safe_id = self._safe_text(point_id)
                     label_dx, label_dy = self._label_offset(
@@ -363,17 +458,36 @@ class TemplateCodeGenerator:
 
             target_infos = self._build_focus_target_infos(focus_entities, point_lookup, primitives, primitive_display)
             targets = [t["expr"] for t in target_infos]
+            emphasis_modes = {
+                str(item.get("mode", "")).strip().lower()
+                for item in emphasis_actions
+                if str(item.get("mode", "")).strip()
+            }
+            highlight_enabled = (
+                any(mode in {"highlight", "maintain"} for mode in emphasis_modes)
+                or ("highlight" in action_types or "maintain" in action_types or "reuse_entities" in action_types)
+            )
+            transform_enabled = (
+                "transform" in emphasis_modes
+                or "transform" in action_types
+            )
 
-            if targets and ("highlight" in action_types or "maintain" in action_types or "reuse_entities" in action_types):
-                hi_time = self._safe_duration(min(0.8, duration * 0.35), 0.2)
+            if targets and highlight_enabled:
+                hi_time = self._safe_duration(
+                    timing_budget.get("emphasis", min(0.8, duration * 0.35)),
+                    0.2,
+                )
                 code.append("        highlight_anims = []")
                 for target_expr in targets:
                     code.append(f"        highlight_anims.append({target_expr}.animate.set_color(YELLOW))")
                 code.append(f"        self.play(*highlight_anims, run_time={hi_time:.2f})")
                 used += hi_time
 
-            if targets and "transform" in action_types:
-                tf_time = self._safe_duration(min(0.9, duration * 0.30), 0.2)
+            if targets and transform_enabled:
+                tf_time = self._safe_duration(
+                    timing_budget.get("transform", min(0.9, duration * 0.30)),
+                    0.2,
+                )
                 code.append("        transform_anims = []")
                 for info in target_infos:
                     if info.get("kind") == "line":
@@ -387,13 +501,28 @@ class TemplateCodeGenerator:
                 code.append(f"        self.play(*transform_anims, run_time={tf_time:.2f})")
                 used += tf_time
 
-            if target_infos and "label" in action_types:
-                show_label_time = self._safe_duration(min(0.6, duration * 0.2), 0.15)
-                hide_label_time = self._safe_duration(min(0.4, duration * 0.15), 0.1)
+            label_target_ids = {
+                str(item.get("target", "")).strip()
+                for item in label_actions
+                if str(item.get("target", "")).strip()
+            }
+            label_target_infos = [
+                info
+                for info in target_infos
+                if info.get("kind") == "point" and (not label_target_ids or info.get("id") in label_target_ids)
+            ]
+
+            if label_target_infos and (label_actions or "label" in action_types):
+                show_label_time = self._safe_duration(
+                    timing_budget.get("label_show", min(0.6, duration * 0.2)),
+                    0.15,
+                )
+                hide_label_time = self._safe_duration(
+                    timing_budget.get("label_hide", min(0.4, duration * 0.15)),
+                    0.1,
+                )
                 code.append("        temp_labels = VGroup()")
-                for info in target_infos:
-                    if info.get("kind") != "point":
-                        continue
+                for info in label_target_infos:
                     entity = self._safe_text(info["id"])
                     code.append(
                         f"        temp_labels.add(Text('{entity}', font_size=24, color=GREEN).next_to({info['expr']}, UP * 0.25))"
@@ -403,8 +532,12 @@ class TemplateCodeGenerator:
                 code.append(f"            self.play(FadeOut(temp_labels), run_time={hide_label_time:.2f})")
                 used += show_label_time + hide_label_time
 
-            if targets and ("highlight" in action_types or "transform" in action_types or "maintain" in action_types):
-                restore_time = self._safe_duration(min(0.4, duration * 0.15), 0.1)
+            restore_enabled = bool(restore_actions) or highlight_enabled or transform_enabled or "maintain" in action_types
+            if targets and restore_enabled:
+                restore_time = self._safe_duration(
+                    timing_budget.get("restore", min(0.4, duration * 0.15)),
+                    0.1,
+                )
                 code.append("        restore_anims = []")
                 for info in target_infos:
                     if info.get("kind") == "line":
@@ -427,47 +560,16 @@ class TemplateCodeGenerator:
 
         return "\n".join(code)
 
-    def validate_formal_video_code(self, manim_code: str) -> Tuple[bool, str]:
-        code = str(manim_code or "")
-        if len(code.strip()) < 50:
-            return False, "generated Manim code is empty or too short"
-
-        debug_markers = [
-            "class DataAnalysisScene",
-            "Drawable Scene",
-            "Semantic Graph",
-            "Geometry Graph",
-            "layout_mode:",
-            "points: {}",
-            "lines: []",
-            "node_count:",
-            "edge_count:",
-        ]
-        for marker in debug_markers:
-            if marker in code:
-                return False, f"generated Manim code contains debug-only marker: {marker}"
-
-        if "points['" not in code:
-            return False, "generated Manim code does not create any drawable points"
-
-        has_geometry_container = "lines['" in code or "objects['" in code
-        if not has_geometry_container:
-            return False, "generated Manim code does not create drawable geometry objects"
-
-        geometry_tokens = [
-            "Dot(",
-            "Line(",
-            "DashedLine(",
-            "Polygon(",
-            "Circle(",
-            "Angle(",
-            "RightAngle(",
-            "Arc(",
-        ]
-        if not any(token in code for token in geometry_tokens):
-            return False, "generated Manim code is missing core geometric constructors"
-
-        return True, ""
+    def validate_formal_video_code(
+        self,
+        manim_code: str,
+        expected_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[bool, str]:
+        is_valid, error_message, _report = self.validator.validate(
+            manim_code,
+            expected_steps=expected_steps,
+        )
+        return is_valid, error_message
 
     def _validate_drawable_scene_semantics(
         self,
@@ -559,6 +661,23 @@ class TemplateCodeGenerator:
             return round(val, 2)
         except (ValueError, TypeError):
             return default_value
+
+    def _boxes_overlap(
+        self,
+        box_a: Tuple[float, float, float, float],
+        box_b: Tuple[float, float, float, float],
+        eps: float = 1e-3,
+    ) -> bool:
+        ax, ay, aw, ah = box_a
+        bx, by, bw, bh = box_b
+        a_left, a_top, a_right, a_bottom = ax, ay, ax + aw, ay + ah
+        b_left, b_top, b_right, b_bottom = bx, by, bx + bw, by + bh
+        return not (
+            a_right <= b_left + eps
+            or b_right <= a_left + eps
+            or a_bottom <= b_top + eps
+            or b_bottom <= a_top + eps
+        )
 
     def _to_mathtex(self, text: str) -> str:
         if not self._looks_like_formula(text):
@@ -744,8 +863,28 @@ class TemplateCodeGenerator:
                 continue
             primitive_id = str(primitive.get("id", "")).strip()
             primitive_type = str(primitive.get("type", "")).strip().lower()
+            refs = [str(item).strip() for item in (primitive.get("points") or []) if str(item).strip()]
             if not primitive_id:
                 continue
+
+            # 仅允许引用当前场景已可绘制的 primitive，避免后续访问未注册对象。
+            drawable = True
+            if primitive_type == "segment":
+                drawable = len(refs) == 2 and all(ref in point_ids for ref in refs)
+            elif primitive_type == "polygon":
+                drawable = len(refs) >= 3 and all(ref in point_ids for ref in refs)
+            elif primitive_type == "circle":
+                center = str(primitive.get("center", "")).strip()
+                radius_point = str(primitive.get("radius_point", "")).strip()
+                drawable = bool(center and radius_point and center in point_ids and radius_point in point_ids)
+            elif primitive_type == "arc":
+                center = str(primitive.get("center", "")).strip()
+                drawable = bool(center and center in point_ids and len(refs) == 2 and all(ref in point_ids for ref in refs))
+            elif primitive_type in {"angle", "right_angle"}:
+                drawable = len(refs) == 3 and all(ref in point_ids for ref in refs)
+            if not drawable:
+                continue
+
             show_primitive = self._display_bool(
                 primitive_display,
                 primitive_id,

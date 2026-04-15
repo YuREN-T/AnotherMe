@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from .anotherme_executor import (
     run_problem_video_job,
     synthesize_problem_image_from_text,
 )
+from .chat_service import extract_learning_records
 from .config import Settings
 from .models import Job, JobArtifact, JobEvent
 from .openmaic_client import OpenMAICClient, OpenMAICError
@@ -72,7 +74,7 @@ def add_artifact(
             artifact_type=artifact_type,
             object_key=object_key,
             url=url,
-            metadata=metadata,
+            artifact_metadata=metadata,
         )
     )
 
@@ -132,6 +134,20 @@ def create_or_get_job(
     return job, True
 
 
+def dequeue_next_queued_job(session: Session, queue_names: list[str]) -> QueueMessage | None:
+    for queue_name in queue_names:
+        job = (
+            session.query(Job)
+            .filter(Job.queue_name == queue_name, Job.status == JobStatus.QUEUED.value)
+            .order_by(Job.created_at.asc())
+            .first()
+        )
+        if not job:
+            continue
+        return QueueMessage(job_id=job.id, job_type=job.job_type, queue_name=job.queue_name)
+    return None
+
+
 def _mark_running(session: Session, job: Job, step: str, message: str, progress: int) -> None:
     now = _utcnow()
     if not job.started_at:
@@ -172,7 +188,7 @@ def _run_course_generate(
     client = OpenMAICClient(settings.openmaic_base_url)
 
     _mark_running(session, job, "submitting_openmaic", "Submitting course generation to OpenMAIC", 5)
-    session.flush()
+    session.commit()
 
     submitted = client.submit_course_job(payload)
     openmaic_job_id = submitted.get("jobId") or submitted.get("job_id")
@@ -181,7 +197,7 @@ def _run_course_generate(
 
     job.engine_state = {**(job.engine_state or {}), "openmaic_job_id": openmaic_job_id}
     add_event(session, job.id, "engine_state", "OpenMAIC job submitted", {"openmaic_job_id": openmaic_job_id})
-    session.flush()
+    session.commit()
 
     start = time.time()
     while True:
@@ -192,7 +208,7 @@ def _run_course_generate(
         message = str(poll.get("message") or "Polling OpenMAIC job")
 
         _mark_running(session, job, step, message, progress)
-        session.flush()
+        session.commit()
 
         done = bool(poll.get("done")) or status in {"succeeded", "failed"}
         if done:
@@ -221,33 +237,53 @@ def _run_problem_video_generate(
     settings: Settings,
     storage: ObjectStorage,
 ) -> Dict[str, Any]:
+    def _resolve_run_output_dir(artifact_path: str) -> Path | None:
+        candidate = Path(artifact_path)
+        if candidate.parent.name == "run_output":
+            return candidate.parent
+        if candidate.parent.parent.name == "run_output":
+            return candidate.parent.parent
+        return None
+
     _mark_running(session, job, "running_anotherme2", "Running AnotherMe2 video pipeline", 10)
-    session.flush()
+    session.commit()
 
     exec_result = run_problem_video_job(payload, storage=storage, temp_root=settings.worker_temp_root)
+    run_output_dir = _resolve_run_output_dir(exec_result.video_path)
 
     _mark_running(session, job, "uploading_artifacts", "Uploading generated artifacts", 80)
-    session.flush()
+    session.commit()
+    try:
+        video_ext = Path(exec_result.video_path).suffix or ".mp4"
+        video_key = f"jobs/{job.id}/problem_video/final{video_ext}"
+        video_url = storage.upload_file(exec_result.video_path, video_key)
+        add_artifact(session, job.id, "problem_video", video_key, video_url)
 
-    video_ext = Path(exec_result.video_path).suffix or ".mp4"
-    video_key = f"jobs/{job.id}/problem_video/final{video_ext}"
-    video_url = storage.upload_file(exec_result.video_path, video_key)
-    add_artifact(session, job.id, "problem_video", video_key, video_url)
+        debug_url = None
+        if exec_result.debug_bundle_path and Path(exec_result.debug_bundle_path).exists():
+            debug_key = f"jobs/{job.id}/problem_video/debug_bundle.zip"
+            debug_url = storage.upload_file(exec_result.debug_bundle_path, debug_key, content_type="application/zip")
+            add_artifact(session, job.id, "debug_bundle", debug_key, debug_url)
 
-    debug_url = None
-    if exec_result.debug_bundle_path and Path(exec_result.debug_bundle_path).exists():
-        debug_key = f"jobs/{job.id}/problem_video/debug_bundle.zip"
-        debug_url = storage.upload_file(exec_result.debug_bundle_path, debug_key, content_type="application/zip")
-        add_artifact(session, job.id, "debug_bundle", debug_key, debug_url)
+        job.engine_state = {**(job.engine_state or {}), "requirement_hint": exec_result.requirement_hint}
+        session.commit()
 
-    job.engine_state = {**(job.engine_state or {}), "requirement_hint": exec_result.requirement_hint}
-
-    return {
-        "video_url": video_url,
-        "duration_sec": exec_result.duration_sec,
-        "script_steps_count": exec_result.script_steps_count,
-        "debug_bundle_url": debug_url,
-    }
+        return {
+            "video_url": video_url,
+            "duration_sec": exec_result.duration_sec,
+            "script_steps_count": exec_result.script_steps_count,
+            "debug_bundle_url": debug_url,
+        }
+    finally:
+        # Keep historical behavior of not accumulating local worker artifacts forever.
+        if run_output_dir and run_output_dir.exists():
+            run_root = run_output_dir.parent
+            shutil.rmtree(run_output_dir, ignore_errors=True)
+            try:
+                if run_root.exists() and not any(run_root.iterdir()):
+                    run_root.rmdir()
+            except OSError:
+                pass
 
 
 def _create_inline_child_job(
@@ -289,7 +325,7 @@ def _run_study_package(
     package_id = f"pkg_{job.id}"
 
     _mark_running(session, job, "package_started", "Running study package orchestration", 5)
-    session.flush()
+    session.commit()
 
     course_result: Dict[str, Any] | None = None
     problem_result: Dict[str, Any] | None = None
@@ -313,7 +349,7 @@ def _run_study_package(
         nonlocal completed_weight
         completed_weight += task_weights.get(task, 0.0)
         _mark_running(session, job, step, message, min(99, int(round(completed_weight))))
-        session.flush()
+        session.commit()
 
     if source["type"] == "topic":
         topic = source["topic"]
@@ -338,7 +374,7 @@ def _run_study_package(
             )
             course_result = _run_course_generate(session, child, child.input_payload, settings)
             _mark_succeeded(session, child, course_result)
-            session.flush()
+            session.commit()
             _mark_parent_task_done("course", "topic_course_done", "Topic course generated")
 
         if outputs.get("problem_video", False):
@@ -363,7 +399,7 @@ def _run_study_package(
             )
             problem_result = _run_problem_video_generate(session, child, child.input_payload, settings, storage)
             _mark_succeeded(session, child, problem_result)
-            session.flush()
+            session.commit()
             _mark_parent_task_done("problem_video", "topic_problem_video_done", "Topic problem video generated")
     else:
         image_object_key = source["image_object_key"]
@@ -384,7 +420,7 @@ def _run_study_package(
             )
             problem_result = _run_problem_video_generate(session, child, child.input_payload, settings, storage)
             _mark_succeeded(session, child, problem_result)
-            session.flush()
+            session.commit()
             requirement_hint = (child.engine_state or {}).get("requirement_hint")
             _mark_parent_task_done("problem_video", "photo_problem_video_done", "Photo problem video generated")
 
@@ -417,7 +453,7 @@ def _run_study_package(
             )
             course_result = _run_course_generate(session, child, child.input_payload, settings)
             _mark_succeeded(session, child, course_result)
-            session.flush()
+            session.commit()
             _mark_parent_task_done("course", "photo_course_done", "Photo-derived course generated")
 
     result = {"package_id": package_id}
@@ -426,6 +462,18 @@ def _run_study_package(
     if problem_result is not None:
         result["problem_video_result"] = problem_result
     return result
+
+
+def _run_learning_record_extract(
+    session: Session,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    return extract_learning_records(
+        session=session,
+        ai_session_id=str(payload["session_id"]),
+        user_id=payload.get("user_id"),
+        extract_version=str(payload.get("extract_version") or "v1"),
+    )
 
 
 def execute_job(session: Session, job: Job, settings: Settings, storage: ObjectStorage) -> Dict[str, Any]:
@@ -437,6 +485,10 @@ def execute_job(session: Session, job: Job, settings: Settings, storage: ObjectS
         return _run_problem_video_generate(session, job, payload, settings, storage)
     if job.job_type == JobType.STUDY_PACKAGE_GENERATE.value:
         return _run_study_package(session, job, payload, settings, storage)
+    if job.job_type == JobType.LEARNING_RECORD_EXTRACT.value:
+        _mark_running(session, job, "extracting_learning_records", "Extracting learning records", 30)
+        session.commit()
+        return _run_learning_record_extract(session, payload)
 
     raise JobServiceError(f"Unsupported job type: {job.job_type}")
 
@@ -474,7 +526,7 @@ def handle_worker_message(
                 f"Job failed; retrying in {delay}s",
                 {"attempt": job.attempt_count, "error": error_message},
             )
-            session.flush()
+            session.commit()
             time.sleep(delay)
             queue_client.enqueue(job.queue_name, QueueMessage(job_id=job.id, job_type=job.job_type, queue_name=job.queue_name))
         else:

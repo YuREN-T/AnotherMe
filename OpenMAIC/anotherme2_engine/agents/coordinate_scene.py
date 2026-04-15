@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -1585,6 +1586,8 @@ class CoordinateSceneCompiler:
             return self._solve_square(spec, solver_trace)
         if template == "rectangle":
             return self._solve_rectangle(spec, solver_trace)
+        if template == "rhombus":
+            return self._solve_rhombus(spec, solver_trace)
         if template == "parallelogram":
             return self._solve_parallelogram(spec, solver_trace)
         if template == "trapezoid":
@@ -1733,9 +1736,42 @@ class CoordinateSceneCompiler:
         solver_trace.append(f"rectangle width={width}, height={height}")
         return coords
 
+    def _solve_rhombus(self, spec: Dict[str, Any], solver_trace: List[str]) -> Dict[str, List[float]]:
+        coords = self._explicit_coord_map(spec)
+        a, b, c, d = self._primary_polygon_points(spec, expected_size=4)
+        side = (
+            self._find_length_between(spec, a, b)
+            or self._find_length_between(spec, b, c)
+            or self._find_length_between(spec, c, d)
+            or self._find_length_between(spec, a, d)
+            or 5.0
+        )
+
+        tangent = self._find_tangent_for_vertex(spec, b, a, c)
+        if tangent is None or abs(tangent) <= EPSILON:
+            tangent = 1.6
+        theta = math.atan(abs(tangent))
+        horizontal = float(side)
+        offset_x = float(side) * math.cos(theta)
+        height = float(side) * math.sin(theta)
+
+        coords.setdefault(b, [0.0, 0.0])
+        coords.setdefault(c, [horizontal, 0.0])
+        coords.setdefault(a, [offset_x, height])
+        coords.setdefault(d, [horizontal + offset_x, height])
+        solver_trace.append(
+            f"rhombus side={side}, tan(vertex {b})={round(float(tangent), 6)}"
+        )
+        return coords
+
     def _solve_parallelogram(self, spec: Dict[str, Any], solver_trace: List[str]) -> Dict[str, List[float]]:
         coords = self._explicit_coord_map(spec)
         a, b, c, d = self._primary_polygon_points(spec, expected_size=4)
+        if "rhombus" in set(spec.get("templates") or []):
+            rhombus_coords = self._solve_rhombus(spec, solver_trace)
+            for point_id, coord in rhombus_coords.items():
+                coords.setdefault(point_id, coord)
+            return coords
         width = self._find_length_between(spec, a, b) or 8.0
         height = self._find_length_between(spec, a, d) or 4.5
         offset = min(float(width) * 0.35, 2.5)
@@ -2656,6 +2692,59 @@ class CoordinateSceneCompiler:
                 return self._coerce_float(measurement.get("value"), default=None)
         return None
 
+    def _find_tangent_for_vertex(
+        self,
+        spec: Dict[str, Any],
+        vertex: str,
+        first: str,
+        second: str,
+    ) -> Optional[float]:
+        pair = {first, second}
+        for measurement in spec.get("measurements", []):
+            if str(measurement.get("type", "")).strip().lower() != "angle":
+                continue
+            entities = [str(item).strip() for item in (measurement.get("entities") or []) if str(item).strip()]
+            if len(entities) != 3 or entities[1] != vertex or {entities[0], entities[2]} != pair:
+                continue
+            tangent = self._parse_tangent_value(measurement.get("value"))
+            if tangent is not None:
+                return tangent
+            tangent = self._parse_tangent_value(measurement.get("description"))
+            if tangent is not None:
+                return tangent
+            tangent = self._parse_tangent_value(measurement.get("name"))
+            if tangent is not None:
+                return tangent
+        return None
+
+    def _parse_tangent_value(self, raw_value: Any) -> Optional[float]:
+        text = str(raw_value or "").strip().lower().replace(" ", "")
+        if not text:
+            return None
+
+        def _parse_numeric_token(token: str) -> Optional[float]:
+            if "/" in token:
+                numerator, denominator = token.split("/", 1)
+                num_value = self._coerce_float(numerator, default=None)
+                den_value = self._coerce_float(denominator, default=None)
+                if num_value is None or den_value is None or abs(den_value) <= EPSILON:
+                    return None
+                return num_value / den_value
+            return self._coerce_float(token, default=None)
+
+        arctan_match = re.search(r"arctan\(([-+]?\d+(?:\.\d+)?(?:/[-+]?\d+(?:\.\d+)?)?)\)", text)
+        if arctan_match:
+            return _parse_numeric_token(arctan_match.group(1))
+
+        tan_match = re.search(r"tan[^=]*=([-+]?\d+(?:\.\d+)?(?:/[-+]?\d+(?:\.\d+)?)?)", text)
+        if tan_match:
+            return _parse_numeric_token(tan_match.group(1))
+
+        trailing_numeric = re.search(r"([-+]?\d+(?:\.\d+)?(?:/[-+]?\d+(?:\.\d+)?)?)", text)
+        if "tan" in text and trailing_numeric:
+            return _parse_numeric_token(trailing_numeric.group(1))
+        return None
+
     def _midpoint_targets(self, spec: Dict[str, Any]) -> List[str]:
         return [str(item.get("entities", [None])[0]) for item in spec.get("constraints", []) if str(item.get("type", "")).lower() == "midpoint" and len(item.get("entities") or []) >= 2]
 
@@ -2707,7 +2796,148 @@ class CoordinateSceneCompiler:
             return self._lerp(coords[a], coords[b], from_a / total)
         if total and from_b is not None:
             return self._lerp(coords[a], coords[b], 1.0 - (from_b / total))
+        fold_position = self._solve_fold_point_on_segment(point_id, segment_id, spec, coords)
+        if fold_position is not None:
+            return fold_position
         return None
+
+    def _solve_fold_point_on_segment(
+        self,
+        point_id: str,
+        segment_id: str,
+        spec: Dict[str, Any],
+        coords: Dict[str, List[float]],
+    ) -> Optional[List[float]]:
+        templates = {str(item).strip().lower() for item in (spec.get("templates") or []) if str(item).strip()}
+        if "fold" not in templates:
+            return None
+        segment = self._segment_ref_from_id(segment_id)
+        if segment is None:
+            return None
+        seg_a, seg_b = segment
+        if seg_a not in coords or seg_b not in coords:
+            return None
+        axis_anchor = self._find_fold_axis_anchor_for_point(spec, point_id)
+        if axis_anchor is None or axis_anchor not in coords:
+            return None
+        fold_angle = self._find_reflection_fold_angle(spec, point_id)
+        if fold_angle is None:
+            return None
+
+        base_start = coords[seg_a]
+        base_end = coords[seg_b]
+        axis_point = coords[axis_anchor]
+        direction = [base_end[0] - base_start[0], base_end[1] - base_start[1]]
+        norm = math.hypot(direction[0], direction[1])
+        if norm <= EPSILON:
+            return None
+        unit = [direction[0] / norm, direction[1] / norm]
+        candidates: List[List[float]] = []
+        for sign in (-1.0, 1.0):
+            rotated = self._rotate_vector(unit, sign * fold_angle / 2.0)
+            intersection = self._line_intersection(
+                axis_point,
+                [axis_point[0] + rotated[0], axis_point[1] + rotated[1]],
+                base_start,
+                base_end,
+            )
+            if intersection is None:
+                continue
+            if self._point_on_segment(intersection, base_start, base_end):
+                candidates.append([round(intersection[0], 6), round(intersection[1], 6)])
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: self._segment_ratio(item, base_start, base_end))
+        for candidate in candidates:
+            ratio = self._segment_ratio(candidate, base_start, base_end)
+            if 0.1 <= ratio <= 0.9:
+                return candidate
+        return candidates[0]
+
+    def _find_fold_axis_anchor_for_point(self, spec: Dict[str, Any], point_id: str) -> Optional[str]:
+        for point in spec.get("points", []):
+            if str(point.get("id", "")).strip() == point_id:
+                continue
+            derived = point.get("derived")
+            if not isinstance(derived, dict):
+                continue
+            if str(derived.get("type", "")).strip().lower() != "reflect_point":
+                continue
+            axis = [str(item).strip() for item in (derived.get("axis") or []) if str(item).strip()]
+            if point_id in axis and len(axis) == 2:
+                return axis[0] if axis[1] == point_id else axis[1]
+        return None
+
+    def _find_reflection_fold_angle(self, spec: Dict[str, Any], axis_point: str) -> Optional[float]:
+        for primitive in spec.get("primitives", []):
+            primitive_type = str(primitive.get("type", "")).strip().lower()
+            if primitive_type not in {"right_angle", "angle"}:
+                continue
+            refs = [str(item).strip() for item in (primitive.get("points") or []) if str(item).strip()]
+            if len(refs) != 3 or refs[1] != axis_point:
+                continue
+            if self._is_reflection_pair(spec, axis_point, refs[0], refs[2]):
+                return math.pi / 2.0 if primitive_type == "right_angle" else None
+
+        for measurement in spec.get("measurements", []):
+            if str(measurement.get("type", "")).strip().lower() != "angle":
+                continue
+            refs = [str(item).strip() for item in (measurement.get("entities") or []) if str(item).strip()]
+            if len(refs) != 3 or refs[1] != axis_point:
+                continue
+            if not self._is_reflection_pair(spec, axis_point, refs[0], refs[2]):
+                continue
+            angle_value = self._coerce_float(measurement.get("value"), default=None)
+            if angle_value is not None:
+                return math.radians(angle_value)
+        return None
+
+    def _is_reflection_pair(self, spec: Dict[str, Any], axis_point: str, first: str, second: str) -> bool:
+        for point in spec.get("points", []):
+            point_id = str(point.get("id", "")).strip()
+            if point_id not in {first, second}:
+                continue
+            derived = point.get("derived")
+            if not isinstance(derived, dict):
+                continue
+            if str(derived.get("type", "")).strip().lower() != "reflect_point":
+                continue
+            source = str(derived.get("source", "")).strip()
+            axis = [str(item).strip() for item in (derived.get("axis") or []) if str(item).strip()]
+            if axis_point in axis and {point_id, source} == {first, second}:
+                return True
+        return False
+
+    def _segment_ref_from_id(self, segment_id: str) -> Optional[Tuple[str, str]]:
+        token = str(segment_id or "").strip()
+        if token.startswith("seg_"):
+            token = token[4:]
+        refs = re.findall(r"[A-Za-z]\d*", token)
+        if len(refs) == 2 and "".join(refs) == token:
+            return refs[0], refs[1]
+        return None
+
+    def _rotate_vector(self, vector: Sequence[float], angle_radians: float) -> List[float]:
+        cos_theta = math.cos(angle_radians)
+        sin_theta = math.sin(angle_radians)
+        return [
+            vector[0] * cos_theta - vector[1] * sin_theta,
+            vector[0] * sin_theta + vector[1] * cos_theta,
+        ]
+
+    def _segment_ratio(
+        self,
+        point: Sequence[float],
+        start: Sequence[float],
+        end: Sequence[float],
+    ) -> float:
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        denom = dx * dx + dy * dy
+        if denom <= EPSILON:
+            return 0.0
+        return ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / denom
 
     def _solve_point_on_circle(
         self,

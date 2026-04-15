@@ -5,8 +5,7 @@
 import json
 import re
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-from langchain_core.messages import HumanMessage, SystemMessage
+from typing import Dict, Any, Optional, List, Set, Tuple
 
 from .base_agent import BaseAgent
 from .state import VideoProject, ScriptStep
@@ -14,7 +13,16 @@ from .vision_tool import VisionTool
 from .canvas_scene import CanvasScene
 from .scene_graph_updater import SceneGraphUpdater
 from .animation_planner import AnimationPlanner
+from .teaching_ir import TeachingIRPlanner
+from .problem_pattern import ProblemPatternClassifier
+from .action_executability_checker import ActionExecutabilityChecker
+from .case_replay_recorder import CaseReplayRecorder
 from .codegen import TemplateCodeGenerator
+from .template_retriever import TemplateRetriever
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
 
 
 class AnimationAgent(BaseAgent):
@@ -58,6 +66,10 @@ class AnimationAgent(BaseAgent):
         self.vision_tool = vision_tool
         self.scene_graph_updater = SceneGraphUpdater()
         self.animation_planner = AnimationPlanner()
+        self.teaching_ir_planner = TeachingIRPlanner()
+        self.problem_pattern_classifier = ProblemPatternClassifier()
+        self.action_executability_checker = ActionExecutabilityChecker()
+        self.case_replay_recorder = CaseReplayRecorder()
         self.use_template_codegen = bool(config.get("use_template_codegen", True))
         self.canvas_config = config.get("canvas_config", {
             "frame_height": 8.0,
@@ -69,290 +81,36 @@ class AnimationAgent(BaseAgent):
             "right_panel_x_min": 1.8,
         })
         self.layout = config.get("layout", "left_graph_right_formula")
-        self.output_dir = Path(config.get("output_dir", "./output"))
+        self.output_dir = Path(config.get("output_dir", str(DEFAULT_OUTPUT_DIR)))
         self.template_codegen = TemplateCodeGenerator(self.canvas_config)
-
-    def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        处理状态，生成 Manim 动画代码
-        直接使用视觉工具分析图片获取图形细节
-        """
-        project = state["project"]
-        if getattr(project, "status", "") == "failed":
-            return state
-        script_steps = project.script_steps
-        image_path = project.problem_image
-
-        if not script_steps:
-            state["messages"].append({
-                "role": "assistant",
-                "content": "错误：没有脚本步骤，无法生成动画"
-            })
-            return state
-
-        # 构建提示词
-        script_description = self._format_script_for_prompt(script_steps)
-
-        # 明确区分语义层与绘图层：动画只能消费 drawable_scene。
-        metadata = state.get("metadata", {})
-        coordinate_scene_data = metadata.get("coordinate_scene")
-        drawable_scene_data = metadata.get("drawable_scene")
-        geometry_spec_data = metadata.get("geometry_spec")
-        semantic_graph_data = metadata.get("semantic_graph") or metadata.get("scene_graph")
-        geometry_graph_data = metadata.get("geometry_graph")
-        coordinate_scene_text = ""
-        drawable_scene_text = ""
-        geometry_spec_text = ""
-        semantic_graph_text = ""
-        geometry_graph_text = ""
-        if coordinate_scene_data:
-            coordinate_scene_text = self._format_scene_graph_for_prompt(coordinate_scene_data)
-        if drawable_scene_data:
-            drawable_scene_text = self._format_scene_graph_for_prompt(drawable_scene_data)
-        if geometry_spec_data:
-            geometry_spec_text = self._format_scene_graph_for_prompt(geometry_spec_data)
-        if semantic_graph_data:
-            semantic_graph_text = self._format_scene_graph_for_prompt(semantic_graph_data)
-        if geometry_graph_data:
-            geometry_graph_text = self._format_scene_graph_for_prompt(geometry_graph_data)
-        known_entities_text = ", ".join(
-            self._collect_known_entities(drawable_scene_data, semantic_graph_data)
+        self.use_template_retrieval = bool(config.get("use_template_retrieval", True))
+        self.template_retrieval_top_k = int(config.get("template_retrieval_top_k", 3))
+        self.template_retrieval_mode = str(config.get("template_retrieval_mode", "component")).strip() or "component"
+        self.template_retrieval_allow_full_scene_fallback = bool(
+            config.get("template_retrieval_allow_full_scene_fallback", True)
+        )
+        self.export_incremental_codegen_debug = bool(
+            config.get("export_incremental_codegen_debug", False)
+        )
+        self.template_retriever = TemplateRetriever(
+            allow_full_scene_fallback=self.template_retrieval_allow_full_scene_fallback,
         )
 
-        step_contexts: List[Dict[str, Any]] = []
-        step_codegen_snapshots: List[Dict[str, Any]] = []
-        step_contexts_text = ""
-        drawable_scene_presentable = self._has_drawable_geometry(drawable_scene_data)
-
-        manim_code = ""
-        codegen_mode = ""
-
-        if self.use_template_codegen and drawable_scene_presentable:
+    def _safe_step_id(self, raw_value: Any, fallback: int) -> int:
+        if isinstance(raw_value, int):
+            return raw_value
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            pass
+        text = str(raw_value or "").strip()
+        match = re.search(r"\d+", text)
+        if match:
             try:
-                manim_code, step_contexts, step_codegen_snapshots = self._generate_template_code_iteratively(
-                    project=project,
-                    steps=script_steps,
-                    coordinate_scene_data=drawable_scene_data,
-                )
-                is_valid, validation_error = self.template_codegen.validate_formal_video_code(manim_code)
-                if not is_valid:
-                    raise ValueError(validation_error)
-                step_contexts_text = self._format_scene_graph_for_prompt(step_contexts)
-                codegen_mode = "template_iterative"
-                print(f"\n[AnimationAgent] 模板迭代 Codegen 生成长度：{len(manim_code)}")
-            except Exception as exc:
-                print(f"\n[AnimationAgent] 模板 Codegen 失败，回退 LLM：{exc}")
-                state["messages"].append({
-                    "role": "assistant",
-                    "content": f"模板 Codegen 失败，自动回退 LLM 生成：{exc}"
-                })
-
-        if not step_contexts and drawable_scene_presentable:
-            step_contexts = self._prepare_animation_context(script_steps, drawable_scene_data)
-        if not step_contexts_text:
-            step_contexts_text = self._format_scene_graph_for_prompt(step_contexts)
-
-        # 回退：若无语义图，再调用视觉工具描述图形
-        geometry_details = ""
-        if not semantic_graph_text and image_path and self.vision_tool:
-            geometry_details = self.vision_tool.describe_geometry(image_path)
-
-        canvas_instructions = self._build_canvas_instructions()
-
-        # 最终回退：如果之前的 codegen 失败了，就直接调用 LLM 生成代码
-        if not manim_code and not drawable_scene_presentable:
-            return self._fail_with_geometry_error(
-                state,
-                "缺少有效 drawable geometry，未生成正式视频脚本；调试信息已保存到 debug/。",
-                "missing valid drawable geometry for formal video generation",
-            )
-
-        if not manim_code:
-            user_prompt = f"""请根据以下视频脚本生成 Manim 动画代码：
-
-视频脚本（含音频同步信息）：
-{script_description}
-
-题目图片分析：
-{geometry_details}
-
-Coordinate Scene（几何真源，优先用于构图与对象复用）：
-{coordinate_scene_text}
-
-Drawable Scene（动画唯一允许直接消费的绘图层；若为 schematic 则仅表示示意布局）：
-{drawable_scene_text}
-
-Geometry Spec（视觉识别出的结构草图，仅作辅助参考）：
-{geometry_spec_text}
-
-Semantic Graph（语义层，仅供关系与实体理解，不要把它当成坐标真值）：
-{semantic_graph_text}
-
-Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
-{geometry_graph_text}
-
-逐步动画计划（SceneGraph 更新 -> Planner -> CanvasScene）：
-{step_contexts_text}
-
-画布与布局约束：
-{canvas_instructions}
-
-当前允许直接引用的实体：
-{known_entities_text}
-
-【强制要求】：
-- 必须输出完整的 Python 代码，从第一行到最后一行，不得截断
-- 所有字符串必须正确闭合（引号成对）
-- 所有括号必须成对出现
-- 不得使用 "..." 或 "# 省略" 代替任何代码
-- 每步开头必须插入 self.add_sound(r"音频路径", time_offset=0)，因为 add_sound 是相对当前步骤起点的
-- 每步的动画 run_time 总和 + self.wait() 必须严格等于该步骤的★音频时长
-- 图形要与题目图片中的几何关系一致
-- 如果提供了 Coordinate Scene：必须优先使用其中的点坐标和 primitive 定义，不要自行发明点位
-- 如果提供了 Drawable Scene：它是动画唯一允许直接消费的绘图层，先构建初始题图骨架并复用已有对象，在后续步骤中只做高亮、标注、变换，不要每步从头重画
-- 如果提供了 Semantic Graph：它只用于理解实体和关系，不要把它当成坐标真值
-- 如果提供了 Geometry Graph：尽量以节点/边 ID 作为对象命名依据，保持同一几何元素在各步骤中是同一对象实例"""
-
-            # 调用 LLM
-            messages = self._format_messages(
-                system_prompt=self.system_prompt,
-                user_prompt=user_prompt
-            )
-
-            manim_code = self._invoke_llm(messages)
-            codegen_mode = "llm"
-
-            print(f"\n[AnimationAgent] LLM 响应长度：{len(manim_code)}")
-
-            # 提取代码块
-            manim_code = self._extract_code_block(manim_code)
-
-            print(f"[AnimationAgent] 提取后代码长度：{len(manim_code)}")
-            print(f"[AnimationAgent] 代码前 50 行：{manim_code[:200]}...")
-
-        # 验证代码是否有效
-        if not manim_code or len(manim_code) < 50:
-            print("[AnimationAgent] 错误：提取的代码太短，流程中止")
-            state["messages"].append({
-                "role": "assistant",
-                "content": "错误：生成的 Manim 代码无效，流程中止"
-            })
-            state["project"].status = "failed"
-            state["project"].error_message = "LLM 生成的 Manim 代码无效或过短"
-            return state
-
-        # 从代码中解析 Scene 类名
-        class_match = re.search(r'class\s+(\w+)\s*\([^)]*Scene[^)]*\)', manim_code)
-        class_name = class_match.group(1) if class_match else "MathAnimation"
-
-        # 更新项目状态
-        project.manim_class_name = class_name
-        project.manim_file_path = "math_animation.py"
-        project.audio_embedded = True  # 音频已通过 add_sound 嵌入 Manim 渲染结果
-
-        state["project"] = project
-        state["current_step"] = "animation_completed"
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"Manim 代码生成完成，类名：{project.manim_class_name}"
-        })
-
-        # 存储完整的 manim 代码到 metadata
-        if "metadata" not in state:
-            state["metadata"] = {}
-        state["metadata"]["manim_code"] = manim_code
-        state["metadata"]["animation_step_contexts"] = step_contexts
-        state["metadata"]["manim_codegen_mode"] = codegen_mode
-        if step_codegen_snapshots:
-            state["metadata"]["animation_step_codegen_snapshots"] = step_codegen_snapshots
-
-        return state
-
-    def _prepare_animation_context(
-        self,
-        steps: List[ScriptStep],
-        coordinate_scene_data: Optional[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """串行执行 scene graph 更新、动画规划、布局生成，供 codegen 使用。"""
-        canvas_scene = CanvasScene()
-        contexts: List[Dict[str, Any]] = []
-        cumulative = 0.0
-        running_scene = self._build_animation_base_scene(coordinate_scene_data)
-
-        for index, step in enumerate(steps, start=1):
-            step_scene = self.scene_graph_updater.build_step_scene(
-                base_scene_graph=running_scene,
-                step=step,
-                step_index=index,
-            )
-            running_scene = step_scene.get("scene", running_scene)
-            plan = self.animation_planner.plan_step(step, step_scene, cumulative)
-            layout = self._layout_step_canvas(canvas_scene, plan)
-
-            contexts.append({
-                "step_id": step.id,
-                "title": step.title,
-                "step_scene": step_scene,
-                "animation_plan": plan,
-                "canvas_layout": layout,
-            })
-
-            cumulative += plan["duration"]
-
-        return contexts
-
-    def _generate_template_code_iteratively(
-        self,
-        project: VideoProject,
-        steps: List[ScriptStep],
-        coordinate_scene_data: Optional[Dict[str, Any]],
-    ) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """逐步执行 Layer1/2/3，并在每步后生成累计代码快照。"""
-        canvas_scene = CanvasScene()
-        cumulative = 0.0
-        contexts: List[Dict[str, Any]] = []
-        snapshots: List[Dict[str, Any]] = []
-        manim_code = ""
-
-        base_coordinate_scene = self._build_animation_base_scene(coordinate_scene_data)
-        running_scene = base_coordinate_scene
-
-        for index, step in enumerate(steps, start=1):
-            step_scene = self.scene_graph_updater.build_step_scene(
-                base_scene_graph=running_scene,
-                step=step,
-                step_index=index,
-            )
-            running_scene = step_scene.get("scene", running_scene)
-            plan = self.animation_planner.plan_step(step, step_scene, cumulative)
-            layout = self._layout_step_canvas(canvas_scene, plan)
-
-            ctx = {
-                "step_id": step.id,
-                "title": step.title,
-                "step_scene": step_scene,
-                "animation_plan": plan,
-                "canvas_layout": layout,
-            }
-            contexts.append(ctx)
-
-            # 每步都做一次累计代码生成，确保链路是“逐步构建”而不是一次性拼装。
-            manim_code = self.template_codegen.generate(
-                project=project,
-                coordinate_scene_data=base_coordinate_scene,
-                step_contexts=contexts,
-            )
-
-            snapshots.append({
-                "step_id": step.id,
-                "code_length": len(manim_code),
-                "debug_code_path": self._export_step_debug_code(index, manim_code),
-                "context": ctx,
-            })
-
-            cumulative += plan["duration"]
-
-        return manim_code, contexts, snapshots
+                return int(match.group(0))
+            except ValueError:
+                pass
+        return fallback
 
     def _build_animation_base_scene(
         self,
@@ -384,11 +142,12 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
                 item["coord"] = [float(source_coord[0]), float(source_coord[1])]
         return base_scene
 
-    def _export_step_debug_code(self, step_index: int, manim_code: str) -> str:
+    def _export_step_debug_code(self, step_index: int, manim_code: str, mode_tag: str = "active") -> str:
         """将每步累计生成代码导出到 output/debug，便于检查循环生成链路。"""
         debug_dir = self.output_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
-        file_path = debug_dir / f"step_{step_index:02d}_manim.py"
+        safe_mode_tag = re.sub(r"[^a-zA-Z0-9_\-]", "_", mode_tag) or "active"
+        file_path = debug_dir / f"step_{step_index:02d}_{safe_mode_tag}_manim.py"
         file_path.write_text(manim_code, encoding="utf-8")
         return str(file_path)
 
@@ -396,6 +155,7 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
         """根据 planner 输出给当前步骤分配公式区布局。"""
         formula_items = plan.get("formula_items", []) # 从计划中获取当前步骤需要展示的公式列表
         reserved_elements = []
+        forced_formula_reset = False
         if formula_items:
             # 调用分局器分配位置
             try:
@@ -406,6 +166,7 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
                 )
             except ValueError:
                 # 公式区不足时清空重排，保证当前步骤有可用布局
+                forced_formula_reset = True
                 reserved_elements = canvas_scene.reserve_step_formula_blocks(
                     step_id=plan["step_id"],
                     formula_items=formula_items,
@@ -424,6 +185,7 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
                 }
                 for element in reserved_elements
             ],
+            "force_formula_reset": forced_formula_reset,
             "snapshot": canvas_scene.get_layout_snapshot(),
         }
 
@@ -566,7 +328,7 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
             for item in primitives
         )
 
-    def _scene_point_ids(self, scene: Optional[Dict[str, Any]]) -> set[str]:
+    def _scene_point_ids(self, scene: Optional[Dict[str, Any]]) -> Set[str]:
         if not isinstance(scene, dict):
             return set()
         points = scene.get("points")
@@ -579,6 +341,82 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
                 if isinstance(item, dict) and str(item.get("id", "")).strip()
             }
         return set()
+
+    def _scene_points(self, scene: Optional[Dict[str, Any]]) -> Dict[str, List[float]]:
+        """提取当前 scene 中可用于位移动画比对的点坐标。"""
+        result: Dict[str, List[float]] = {}
+        if not isinstance(scene, dict):
+            return result
+
+        points = scene.get("points", {})
+        if isinstance(points, dict):
+            for point_id, payload in points.items():
+                if not isinstance(payload, dict):
+                    continue
+                coord = payload.get("coord")
+                pos = coord if isinstance(coord, list) and len(coord) == 2 else payload.get("pos")
+                if not isinstance(pos, list) or len(pos) != 2:
+                    continue
+                try:
+                    result[str(point_id)] = [float(pos[0]), float(pos[1])]
+                except (TypeError, ValueError):
+                    continue
+            return result
+
+        if isinstance(points, list):
+            for item in points:
+                if not isinstance(item, dict):
+                    continue
+                point_id = str(item.get("id", "")).strip()
+                coord = item.get("coord")
+                if not point_id or not isinstance(coord, list) or len(coord) != 2:
+                    continue
+                try:
+                    result[point_id] = [float(coord[0]), float(coord[1])]
+                except (TypeError, ValueError):
+                    continue
+
+        return result
+
+    def _extract_moved_points(
+        self,
+        prev_scene: Dict[str, Any],
+        curr_scene: Dict[str, Any],
+        eps: float = 1e-6,
+    ) -> Dict[str, List[float]]:
+        """比对前后步骤的点位变化，仅提取真正移动过的点。"""
+        prev_points = self._scene_points(prev_scene)
+        curr_points = self._scene_points(curr_scene)
+        moved: Dict[str, List[float]] = {}
+        for point_id, curr_pos in curr_points.items():
+            prev_pos = prev_points.get(point_id)
+            if prev_pos is None:
+                continue
+            if abs(curr_pos[0] - prev_pos[0]) > eps or abs(curr_pos[1] - prev_pos[1]) > eps:
+                moved[point_id] = curr_pos
+        return moved
+
+    def _authoritative_step_scene(
+        self,
+        base_scene: Dict[str, Any],
+        ctx: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """选择当前步骤真正应作为动画真值的 scene。"""
+        if not isinstance(ctx, dict):
+            return base_scene
+        step_scene = ctx.get("step_scene", {})
+        if not isinstance(step_scene, dict):
+            return base_scene
+        if not bool(step_scene.get("allow_geometry_motion", False)):
+            return base_scene
+
+        candidate = step_scene.get("scene", {})
+        if not isinstance(candidate, dict):
+            return base_scene
+
+        if set(self._scene_points(candidate).keys()) != set(self._scene_points(base_scene).keys()):
+            return base_scene
+        return candidate
 
     def _normalize_step_scene_geometry(
         self,
@@ -611,10 +449,18 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
             )
         return step_scene
 
-    def _ensure_presentable_video_code(self, manim_code: str) -> None:
-        is_valid, error_message = self.template_codegen.validate_formal_video_code(manim_code)
+    def _ensure_presentable_video_code(
+        self,
+        manim_code: str,
+        expected_steps: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        is_valid, error_message, report = self.template_codegen.validator.validate(
+            manim_code,
+            expected_steps=expected_steps,
+        )
         if not is_valid:
             raise ValueError(error_message)
+        return report
 
     def _fail_with_geometry_error(
         self,
@@ -630,8 +476,584 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
             project.status = "failed"
             project.error_message = error_message
             state["project"] = project
+
+        metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+        try:
+            case_path = self.case_replay_recorder.record(
+                output_dir=self.output_dir,
+                payload={
+                    "problem_text": str(getattr(project, "problem_text", "") or "")[:240],
+                    "problem_pattern": str((metadata.get("problem_pattern") or {}).get("problem_pattern", "")),
+                    "sub_pattern": str((metadata.get("problem_pattern") or {}).get("sub_pattern", "")),
+                    "execution_check": metadata.get("teaching_ir_execution_check", {}),
+                    "render_result": {
+                        "status": "failed",
+                        "reason": str(error_message),
+                    },
+                },
+            )
+            metadata["case_record_path"] = case_path
+            state["metadata"] = metadata
+        except Exception:
+            pass
+
         state["current_step"] = "animation_failed"
         return state
+
+    def _build_expected_steps(self, steps: List[ScriptStep]) -> List[Dict[str, Any]]:
+        expected: List[Dict[str, Any]] = []
+        for index, step in enumerate(steps, start=1):
+            duration = float(step.audio_duration) if step.audio_duration else float(step.duration)
+            expected.append(
+                {
+                    "step_id": self._safe_step_id(getattr(step, "id", None), index),
+                    "duration": round(duration, 2),
+                }
+            )
+        return expected
+
+    def _derived_point_ids(self, scene: Optional[Dict[str, Any]]) -> Set[str]:
+        result: Set[str] = set()
+        if not isinstance(scene, dict):
+            return result
+        points = scene.get("points")
+        if isinstance(points, list):
+            for item in points:
+                if not isinstance(item, dict):
+                    continue
+                if not isinstance(item.get("derived"), dict):
+                    continue
+                point_id = str(item.get("id", "")).strip()
+                if point_id:
+                    result.add(point_id)
+        elif isinstance(points, dict):
+            for point_id, payload in points.items():
+                if isinstance(payload, dict) and isinstance(payload.get("derived"), dict):
+                    result.add(str(point_id))
+        return result
+
+    def _build_timing_budget(
+        self,
+        *,
+        duration: float,
+        formula_actions: List[Dict[str, Any]],
+        movement_actions: List[Dict[str, Any]],
+        emphasis_actions: List[Dict[str, Any]],
+        label_actions: List[Dict[str, Any]],
+        restore_actions: List[Dict[str, Any]],
+        formula_reset: float,
+    ) -> Dict[str, float]:
+        transform_enabled = any(
+            str(item.get("mode", "")).strip().lower() == "transform"
+            for item in emphasis_actions
+            if isinstance(item, dict)
+        )
+        budget = {
+            "duration": round(float(duration), 2),
+            "formula_reset": round(formula_reset if formula_actions else 0.0, 2),
+            # 公式阅读阶段适当拉长，降低“闪过感”。
+            "formula_show": round(min(1.0, duration * 0.25), 2) if formula_actions else 0.0,
+            "movement": round(min(0.8, duration * 0.30), 2) if movement_actions else 0.0,
+            "emphasis": round(min(0.6, duration * 0.22), 2) if emphasis_actions else 0.0,
+            "transform": round(min(0.7, duration * 0.22), 2) if transform_enabled else 0.0,
+            "label_show": round(min(0.6, duration * 0.20), 2) if label_actions else 0.0,
+            "label_hide": round(min(0.4, duration * 0.15), 2) if label_actions else 0.0,
+            "restore": round(min(0.25, duration * 0.10), 2) if restore_actions else 0.0,
+        }
+        used = sum(float(v) for k, v in budget.items() if k != "duration")
+        budget["wait"] = round(max(duration - used, 0.0), 2)
+        return budget
+
+    def _apply_timing_profile(
+        self,
+        budget: Dict[str, float],
+        *,
+        duration: float,
+        formula_scale: float,
+        movement_scale: float,
+        emphasis_scale: float,
+        label_scale: float,
+    ) -> Dict[str, float]:
+        tuned = dict(budget)
+        scale_map = {
+            "formula_show": formula_scale,
+            "movement": movement_scale,
+            "emphasis": emphasis_scale,
+            "transform": emphasis_scale,
+            "label_show": label_scale,
+            "label_hide": label_scale,
+        }
+        for key, scale in scale_map.items():
+            raw_value = float(tuned.get(key, 0.0) or 0.0)
+            if raw_value <= 0:
+                continue
+            tuned[key] = round(min(duration * 0.7, raw_value * scale), 2)
+
+        used = sum(float(v) for k, v in tuned.items() if k not in {"duration", "wait"})
+        tuned["wait"] = round(max(duration - used, 0.0), 2)
+        tuned["duration"] = round(duration, 2)
+        return tuned
+
+    def _attach_animation_specs(
+        self,
+        contexts: List[Dict[str, Any]],
+        *,
+        base_coordinate_scene: Optional[Dict[str, Any]],
+        conservative: bool,
+        adaptive_plan: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        prev_scene = self._build_animation_base_scene(base_coordinate_scene)
+        hidden_derived = self._derived_point_ids(prev_scene)
+        has_formula_visible = False
+
+        visual_profile = adaptive_plan.get("visual_profile") if isinstance(adaptive_plan, dict) and isinstance(adaptive_plan.get("visual_profile"), dict) else {}
+        scaffold_level = str(visual_profile.get("scaffold_level", "medium") or "medium").lower()
+        highlight_intensity = str(visual_profile.get("highlight_intensity", "medium") or "medium").lower()
+        label_key_entities = bool(visual_profile.get("label_key_entities", False))
+        blink_auxiliary_lines = bool(visual_profile.get("blink_auxiliary_lines", False))
+
+        formula_scale = 1.0
+        movement_scale = 1.0
+        emphasis_scale = 1.0
+        label_scale = 1.0
+        force_labels = False
+        if scaffold_level == "high":
+            formula_scale = 1.35
+            movement_scale = 1.15
+            emphasis_scale = 1.35
+            label_scale = 1.3
+            force_labels = True
+        elif scaffold_level == "low":
+            formula_scale = 0.9
+            movement_scale = 0.9
+            emphasis_scale = 0.85
+            label_scale = 0.85
+
+        if highlight_intensity == "high":
+            emphasis_scale = max(emphasis_scale, 1.5)
+        elif highlight_intensity == "low":
+            emphasis_scale = min(emphasis_scale, 0.85)
+
+        for index, ctx in enumerate(contexts, start=1):
+            plan = ctx.get("animation_plan", {})
+            step_scene = ctx.get("step_scene", {})
+            current_scene = self._authoritative_step_scene(prev_scene, ctx)
+            focus_entities = list(plan.get("focus_entities", []) or [])
+            duration = float(plan.get("duration", 1.0) or 1.0)
+            action_types = {
+                str(item.get("type", "")).strip().lower()
+                for item in (plan.get("actions", []) or [])
+                if isinstance(item, dict)
+            }
+            layout = ctx.get("canvas_layout", {})
+            formula_elements = list(layout.get("reserved_formula_elements", []) or [])
+            force_formula_reset = bool(layout.get("force_formula_reset", False))
+            formula_actions = [
+                {
+                    "type": "show_formula",
+                    "content": str(item.get("content", "")),
+                    "layout": item,
+                }
+                for item in formula_elements
+                if isinstance(item, dict)
+            ]
+
+            moved_points = self._extract_moved_points(prev_scene, current_scene)
+            movement_actions: List[Dict[str, Any]] = []
+            if not conservative:
+                movement_actions = [
+                    {
+                        "type": "move_point",
+                        "point_id": point_id,
+                        "reveal": point_id in hidden_derived,
+                    }
+                    for point_id in moved_points.keys()
+                ]
+
+            emphasis_mode = "transform" if ("transform" in action_types and not conservative) else "highlight"
+            if not conservative and highlight_intensity == "high":
+                emphasis_mode = "maintain"
+            emphasis_actions: List[Dict[str, Any]] = []
+            if focus_entities:
+                emphasis_actions.append(
+                    {
+                        "type": "highlight",
+                        "mode": emphasis_mode,
+                        "targets": focus_entities,
+                    }
+                )
+
+            label_actions: List[Dict[str, Any]] = []
+            if not conservative and ("label" in action_types or force_labels or label_key_entities):
+                label_actions = [
+                    {
+                        "type": "show_temp_label",
+                        "target": entity_id,
+                    }
+                    for entity_id in (focus_entities[:3] if force_labels else focus_entities)
+                ]
+
+            if not conservative and blink_auxiliary_lines and focus_entities:
+                emphasis_actions.append(
+                    {
+                        "type": "highlight",
+                        "mode": "transform",
+                        "targets": focus_entities[:2],
+                    }
+                )
+
+            restore_actions: List[Dict[str, Any]] = []
+            if focus_entities:
+                restore_actions.append(
+                    {
+                        "type": "restore_style",
+                        "targets": focus_entities,
+                    }
+                )
+
+            timing_budget = self._build_timing_budget(
+                duration=duration,
+                formula_actions=formula_actions,
+                movement_actions=movement_actions,
+                emphasis_actions=emphasis_actions,
+                label_actions=label_actions,
+                restore_actions=restore_actions,
+                formula_reset=0.20 if ((plan.get("reset_formula_area", False) or force_formula_reset) and has_formula_visible and formula_actions) else 0.0,
+            )
+            timing_budget = self._apply_timing_profile(
+                timing_budget,
+                duration=duration,
+                formula_scale=formula_scale,
+                movement_scale=movement_scale,
+                emphasis_scale=emphasis_scale,
+                label_scale=label_scale,
+            )
+
+            ctx["animation_spec"] = {
+                "step_id": self._safe_step_id(plan.get("step_id"), index),
+                "title": str(plan.get("title", "")),
+                "fallback_mode": "conservative" if conservative else "formal",
+                "focus_entities": focus_entities,
+                "formula_actions": formula_actions,
+                "reset_formula_area": bool(plan.get("reset_formula_area", False) or force_formula_reset),
+                "movement_actions": movement_actions,
+                "emphasis_actions": emphasis_actions,
+                "label_actions": label_actions,
+                "restore_actions": restore_actions,
+                "timing_budget": timing_budget,
+            }
+
+            has_formula_visible = bool(formula_actions)
+            prev_scene = current_scene if isinstance(current_scene, dict) and current_scene else prev_scene
+
+    def _write_debug_json(self, filename: str, payload: Any) -> None:
+        debug_dir = self.output_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _write_debug_text(self, filename: str, content: str) -> None:
+        debug_dir = self.output_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / filename).write_text(str(content), encoding="utf-8")
+
+    def _normalize_string_items(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = re.split(r"[\s,;/|]+", value)
+            return sorted({part.strip().lower() for part in parts if part.strip()})
+        if isinstance(value, list):
+            result: List[str] = []
+            for item in value:
+                result.extend(self._normalize_string_items(item))
+            return sorted(set(result))
+        return [str(value).strip().lower()]
+
+    def _build_template_retrieval_query(
+        self,
+        metadata: Dict[str, Any],
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        drawable_scene = metadata.get("drawable_scene") or {}
+        geometry_facts = metadata.get("geometry_facts") or {}
+        primitives = sorted(
+            {
+                str(item.get("type", "")).strip().lower()
+                for item in (drawable_scene.get("primitives") or [])
+                if isinstance(item, dict) and str(item.get("type", "")).strip()
+            }
+        )
+        template_hints = self._normalize_string_items(
+            (geometry_facts.get("templates") if isinstance(geometry_facts, dict) else [])
+            or metadata.get("template_hints")
+            or []
+        )
+        motions: List[str] = []
+        tags = set(template_hints)
+        summary_parts: List[str] = []
+
+        if ctx:
+            plan = ctx.get("animation_plan", {})
+            animation_spec = ctx.get("animation_spec", {})
+            summary_parts.extend(
+                [
+                    str(ctx.get("title", "")).strip(),
+                    str(plan.get("title", "")).strip(),
+                ]
+            )
+            for item in (plan.get("actions") or []):
+                if isinstance(item, dict) and str(item.get("type", "")).strip():
+                    motions.append(str(item.get("type", "")).strip().lower())
+            for field_name in (
+                "movement_actions",
+                "emphasis_actions",
+                "label_actions",
+                "restore_actions",
+                "formula_actions",
+            ):
+                for item in animation_spec.get(field_name, []) or []:
+                    if isinstance(item, dict) and str(item.get("type", "")).strip():
+                        motions.append(str(item.get("type", "")).strip().lower())
+
+        if "circle" in primitives:
+            tags.add("circle")
+        if "angle" in primitives or "right_angle" in primitives:
+            tags.add("angle")
+        if "arc" in primitives:
+            tags.add("circle")
+        if any(item in motions for item in {"move_point", "translation"}):
+            tags.add("translation")
+        if any(item in motions for item in {"transform", "rotation"}):
+            tags.add("rotation")
+        if "fold" in template_hints or "reflection" in template_hints:
+            tags.add("fold")
+
+        summary = " ".join(part for part in summary_parts if part).strip()
+        return {
+            "summary": summary,
+            "tags": sorted(tags),
+            "primitives": primitives,
+            "motions": sorted(set(motions)),
+            "helpers": [],
+            "template_hints": template_hints,
+        }
+
+    def _annotate_template_references(
+        self,
+        metadata: Dict[str, Any],
+        contexts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not self.use_template_retrieval:
+            metadata["template_references"] = []
+            metadata["template_retrieval_query"] = {}
+            metadata["template_retrieval_mode"] = "disabled"
+            return []
+
+        aggregate: Dict[str, Dict[str, Any]] = {}
+        query_log: Dict[str, Any] = {
+            "mode": self.template_retrieval_mode,
+            "top_k": self.template_retrieval_top_k,
+            "steps": [],
+        }
+
+        global_query = self._build_template_retrieval_query(metadata)
+        query_log["global"] = global_query
+
+        for ctx in contexts:
+            step_query = self._build_template_retrieval_query(metadata, ctx=ctx)
+            refs = [
+                item.to_payload()
+                for item in self.template_retriever.retrieve(step_query, top_k=self.template_retrieval_top_k)
+            ]
+            ctx["retrieved_templates"] = refs
+            query_log["steps"].append(
+                {
+                    "step_id": ctx.get("step_id"),
+                    "query": step_query,
+                    "result_ids": [item.get("id") for item in refs],
+                }
+            )
+            for item in refs:
+                current = aggregate.get(str(item.get("id")))
+                if current is None or float(item.get("score", 0.0)) > float(current.get("score", 0.0)):
+                    aggregate[str(item.get("id"))] = item
+
+        if not aggregate:
+            for item in self.template_retriever.retrieve(global_query, top_k=self.template_retrieval_top_k):
+                aggregate[item.id] = item.to_payload()
+
+        ordered = sorted(
+            aggregate.values(),
+            key=lambda item: (-float(item.get("score", 0.0)), str(item.get("id", ""))),
+        )
+        metadata["template_references"] = ordered
+        metadata["template_retrieval_query"] = query_log
+        metadata["template_retrieval_mode"] = self.template_retrieval_mode
+        return ordered
+
+    def _format_template_references_for_prompt(self, references: List[Dict[str, Any]]) -> str:
+        if not references:
+            return "无"
+        chunks: List[str] = []
+        for item in references[: max(1, self.template_retrieval_top_k + 1)]:
+            chunks.append(
+                "\n".join(
+                    [
+                        f"- 模板ID: {item.get('id', '')}",
+                        f"  场景/片段: {item.get('snippet_name', '')}",
+                        f"  摘要: {item.get('summary', '')}",
+                        f"  命中原因: {item.get('reason', '')}",
+                        f"  可用 helper: {', '.join(item.get('helpers', []) or []) or '无'}",
+                        f"  参考代码片段:\n```python\n{item.get('excerpt', '')}\n```",
+                    ]
+                )
+            )
+        return "\n\n".join(chunks)
+
+    def _summarize_template_adoption(
+        self,
+        manim_code: str,
+        references: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        helper_hits = sorted(
+            {
+                helper
+                for item in references
+                for helper in (item.get("helpers") or [])
+                if helper and re.search(rf"\b{re.escape(str(helper))}\b", manim_code)
+            }
+        )
+        matched_reference_ids = sorted(
+            {
+                str(item.get("id"))
+                for item in references
+                if any(
+                    helper and re.search(rf"\b{re.escape(str(helper))}\b", manim_code)
+                    for helper in (item.get("helpers") or [])
+                )
+            }
+        )
+        return {
+            "helper_hits": helper_hits,
+            "matched_reference_ids": matched_reference_ids,
+            "reference_count": len(references),
+        }
+
+    def _build_template_candidate(
+        self,
+        *,
+        project: VideoProject,
+        steps: List[ScriptStep],
+        coordinate_scene_data: Optional[Dict[str, Any]],
+        teaching_ir: Optional[Dict[str, Any]] = None,
+        expected_steps: List[Dict[str, Any]],
+        conservative: bool,
+        adaptive_plan: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        candidate = {
+            "ok": False,
+            "mode": "template_conservative" if conservative else "template_formal",
+            "fallback_level": "conservative" if conservative else "formal",
+            "code": "",
+            "contexts": [],
+            "snapshots": [],
+            "report": {},
+            "error": None,
+        }
+        try:
+            code, contexts, snapshots = self._generate_template_code_iteratively(
+                project=project,
+                steps=steps,
+                coordinate_scene_data=coordinate_scene_data,
+                teaching_ir=teaching_ir,
+                expected_steps=expected_steps,
+                conservative=conservative,
+                adaptive_plan=adaptive_plan,
+            )
+            report = self._ensure_presentable_video_code(code, expected_steps)
+            candidate.update(
+                {
+                    "ok": True,
+                    "code": code,
+                    "contexts": contexts,
+                    "snapshots": snapshots,
+                    "report": report,
+                }
+            )
+        except Exception as exc:
+            candidate["error"] = str(exc)
+        return candidate
+
+    def _build_llm_fallback_candidate(
+        self,
+        *,
+        steps: List[ScriptStep],
+        metadata: Dict[str, Any],
+        expected_steps: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        candidate = {
+            "ok": False,
+            "mode": "llm_fallback",
+            "fallback_level": "llm",
+            "code": "",
+            "contexts": [],
+            "snapshots": [],
+            "report": {},
+            "error": None,
+        }
+        if self.llm is None:
+            candidate["error"] = "llm is not configured"
+            return candidate
+
+        try:
+            scene_payload = metadata.get("drawable_scene") or metadata.get("semantic_graph") or {}
+            known_entities = self._collect_known_entities(
+                metadata.get("drawable_scene"),
+                metadata.get("semantic_graph"),
+            )
+            template_references = metadata.get("template_references", [])
+            prompt = (
+                "请根据以下结构化几何信息与讲解脚本，输出完整可运行的 Manim 代码。\n"
+                "必须满足音画同步与时长约束，禁止省略代码。\n\n"
+                "[画布约束]\n"
+                f"{self._build_canvas_instructions()}\n\n"
+                "[已知几何实体 ID]\n"
+                f"{', '.join(known_entities) if known_entities else '无'}\n\n"
+                "[脚本步骤]\n"
+                f"{self._format_script_for_prompt(steps)}\n\n"
+                "[结构化几何 Scene]\n"
+                f"{self._format_scene_graph_for_prompt(scene_payload)}\n\n"
+                "[模板参考 - 只用于学习写法，不是答案]\n"
+                f"{self._format_template_references_for_prompt(template_references)}\n\n"
+                "[模板使用规则]\n"
+                "- 这些模板只用于学习对象组织、动画写法和 helper 用法。\n"
+                "- 绝对不能照搬模板里的坐标、点名、题设关系、整段场景流程。\n"
+                "- 几何实体、位置、步骤顺序必须以当前题目的结构化数据为准。\n"
+                "- 若模板与当前题目冲突，必须服从当前题目的 scene_graph / drawable_scene。\n"
+                "- 如果借鉴 helper，请在生成代码里内联必要 helper，不要 import 外部模板文件。"
+            )
+            messages = self._format_messages(system_prompt=self.system_prompt, user_prompt=prompt)
+            response = self._invoke_llm(messages)
+            code = self._extract_code_block(response or "")
+            if not str(code).strip():
+                raise ValueError("llm returned empty code")
+
+            report = self._ensure_presentable_video_code(code, expected_steps)
+            candidate.update(
+                {
+                    "ok": True,
+                    "code": str(code),
+                    "report": report,
+                }
+            )
+        except Exception as exc:
+            candidate["error"] = str(exc)
+
+        return candidate
 
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Generate formal Manim lecture-video code from validated geometry only."""
@@ -640,7 +1062,6 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
             return state
 
         script_steps = project.script_steps
-        image_path = project.problem_image
         if not script_steps:
             state["messages"].append({
                 "role": "assistant",
@@ -648,123 +1069,214 @@ Geometry Graph（节点/边关系图，用于对象复用与关系约束）：
             })
             return state
 
-        metadata = state.get("metadata", {})
-        coordinate_scene_data = metadata.get("coordinate_scene")
+        metadata = state.setdefault("metadata", {})
+        adaptive_plan = metadata.get("adaptive_plan") if isinstance(metadata.get("adaptive_plan"), dict) else {}
+        problem_text = str(getattr(project, "problem_text", "") or "")
+
+        problem_pattern = self.problem_pattern_classifier.classify(
+            problem_text=problem_text,
+            metadata=metadata,
+        )
+        metadata["problem_pattern"] = problem_pattern
+        self._write_debug_json("problem_pattern.json", problem_pattern)
+
         drawable_scene_data = metadata.get("drawable_scene")
-        geometry_spec_data = metadata.get("geometry_spec")
-        semantic_graph_data = metadata.get("semantic_graph") or metadata.get("scene_graph")
-        geometry_graph_data = metadata.get("geometry_graph")
-
-        coordinate_scene_text = self._format_scene_graph_for_prompt(coordinate_scene_data) if coordinate_scene_data else ""
-        drawable_scene_text = self._format_scene_graph_for_prompt(drawable_scene_data) if drawable_scene_data else ""
-        geometry_spec_text = self._format_scene_graph_for_prompt(geometry_spec_data) if geometry_spec_data else ""
-        semantic_graph_text = self._format_scene_graph_for_prompt(semantic_graph_data) if semantic_graph_data else ""
-        geometry_graph_text = self._format_scene_graph_for_prompt(geometry_graph_data) if geometry_graph_data else ""
-        known_entities_text = ", ".join(self._collect_known_entities(drawable_scene_data, semantic_graph_data))
-        script_description = self._format_script_for_prompt(script_steps)
-
         drawable_scene_presentable = self._has_drawable_geometry(drawable_scene_data)
-        step_contexts: List[Dict[str, Any]] = []
-        step_codegen_snapshots: List[Dict[str, Any]] = []
-        step_contexts_text = ""
-        manim_code = ""
-        codegen_mode = ""
-
-        if self.use_template_codegen and drawable_scene_presentable:
-            try:
-                manim_code, step_contexts, step_codegen_snapshots = self._generate_template_code_iteratively(
-                    project=project,
-                    steps=script_steps,
-                    coordinate_scene_data=drawable_scene_data,
-                )
-                self._ensure_presentable_video_code(manim_code)
-                step_contexts_text = self._format_scene_graph_for_prompt(step_contexts)
-                codegen_mode = "template_iterative"
-            except Exception as exc:
-                print(f"\n[AnimationAgent] template codegen failed, considering constrained LLM fallback: {exc}")
-                state["messages"].append({
-                    "role": "assistant",
-                    "content": f"模板 codegen 未通过正式视频校验，将尝试受约束的 LLM 生成：{exc}",
-                })
-                manim_code = ""
-
-        if not step_contexts and drawable_scene_presentable:
-            step_contexts = self._prepare_animation_context(script_steps, drawable_scene_data)
-        if not step_contexts_text:
-            step_contexts_text = self._format_scene_graph_for_prompt(step_contexts)
-
-        geometry_details = ""
-        if not semantic_graph_text and image_path and self.vision_tool:
-            geometry_details = self.vision_tool.describe_geometry(image_path)
-
-        if not manim_code and not drawable_scene_presentable:
+        if not drawable_scene_presentable:
             return self._fail_with_geometry_error(
                 state,
                 "缺少有效 drawable geometry，未生成正式视频脚本；调试信息已保存到 debug/。",
                 "missing valid drawable geometry for formal video generation",
             )
 
-        if not manim_code:
-            canvas_instructions = self._build_canvas_instructions()
-            user_prompt = f"""请生成正式的 Manim 几何讲解视频代码。
+        geometry_ir = self.teaching_ir_planner.build_geometry_ir(
+            metadata=metadata,
+            problem_text=problem_text,
+        )
+        if not str(geometry_ir.get("problem_pattern", "")).strip():
+            geometry_ir["problem_pattern"] = str(problem_pattern.get("problem_pattern", ""))
+        if not str(geometry_ir.get("sub_pattern", "")).strip():
+            geometry_ir["sub_pattern"] = str(problem_pattern.get("sub_pattern", ""))
 
-脚本步骤：
-{script_description}
+        teaching_ir = self.teaching_ir_planner.build_teaching_ir(
+            steps=script_steps,
+            geometry_ir=geometry_ir,
+            metadata=metadata,
+            problem_text=problem_text,
+        )
 
-图形补充描述：
-{geometry_details}
+        teaching_ir, execution_check = self.action_executability_checker.check_and_repair(
+            teaching_ir=teaching_ir,
+            geometry_ir=geometry_ir,
+        )
 
-Coordinate Scene:
-{coordinate_scene_text}
+        metadata["geometry_ir"] = geometry_ir
+        metadata["teaching_ir"] = teaching_ir
+        metadata["teaching_ir_execution_check"] = execution_check
+        self._write_debug_json("geometry_ir.json", geometry_ir)
+        self._write_debug_json("teaching_ir.json", teaching_ir)
+        self._write_debug_json("teaching_ir_execution_check.json", execution_check)
 
-Drawable Scene:
-{drawable_scene_text}
-
-Geometry Spec:
-{geometry_spec_text}
-
-Semantic Graph:
-{semantic_graph_text}
-
-Geometry Graph:
-{geometry_graph_text}
-
-Step Contexts:
-{step_contexts_text}
-
-Canvas Instructions:
-{canvas_instructions}
-
-Known Entities:
-{known_entities_text}
-
-强约束：
-- 这是面向学生的正式讲解视频，不是调试页，不是数据分析页。
-- 严禁把 Drawable Scene、Semantic Graph、Geometry Graph、layout_mode、points: {{}}、lines: [] 这类调试信息直接画到视频里。
-- 必须绘制真实几何对象，至少包含可见的点和线；不能只用 Text、Rectangle、VGroup 做信息卡片。
-- 如果你引用新的几何对象，它必须来自已有 drawable scene 或当前步骤的显式构造。
-- 输出必须是可运行的 Python Manim 代码，不要附加解释文字。"""
-            messages = self._format_messages(
-                system_prompt=self.system_prompt,
-                user_prompt=user_prompt,
+        expected_steps = self._build_expected_steps(script_steps)
+        if self.use_template_codegen:
+            formal_candidate = self._build_template_candidate(
+                project=project,
+                steps=script_steps,
+                coordinate_scene_data=drawable_scene_data,
+                teaching_ir=teaching_ir,
+                expected_steps=expected_steps,
+                conservative=False,
+                adaptive_plan=adaptive_plan,
             )
-            manim_code = self._extract_code_block(self._invoke_llm(messages))
-            try:
-                self._ensure_presentable_video_code(manim_code)
-            except Exception as exc:
-                return self._fail_with_geometry_error(
-                    state,
-                    "生成结果不是正式几何讲解视频脚本，已拒绝写入；调试信息已保存到 debug/。",
-                    str(exc),
-                )
-            codegen_mode = "llm"
+            conservative_candidate = self._build_template_candidate(
+                project=project,
+                steps=script_steps,
+                coordinate_scene_data=drawable_scene_data,
+                teaching_ir=teaching_ir,
+                expected_steps=expected_steps,
+                conservative=True,
+                adaptive_plan=adaptive_plan,
+            )
+        else:
+            formal_candidate = {
+                "ok": False,
+                "mode": "template_formal",
+                "fallback_level": "formal",
+                "code": "",
+                "contexts": [],
+                "snapshots": [],
+                "report": {},
+                "error": "template generation disabled by config",
+            }
+            conservative_candidate = {
+                "ok": False,
+                "mode": "template_conservative",
+                "fallback_level": "conservative",
+                "code": "",
+                "contexts": [],
+                "snapshots": [],
+                "report": {},
+                "error": "template generation disabled by config",
+            }
 
-        if not manim_code or len(manim_code) < 50:
+        retrieval_contexts = list(formal_candidate["contexts"] or conservative_candidate["contexts"] or [])
+        if not retrieval_contexts:
+            retrieval_contexts = self._prepare_animation_context(
+                script_steps,
+                drawable_scene_data,
+                teaching_ir=teaching_ir,
+            )
+            self._attach_animation_specs(
+                retrieval_contexts,
+                base_coordinate_scene=drawable_scene_data,
+                conservative=False,
+                adaptive_plan=adaptive_plan,
+            )
+        template_references = self._annotate_template_references(metadata, retrieval_contexts)
+        self._write_debug_json("template_references.json", template_references)
+        self._write_debug_json("template_retrieval_query.json", metadata.get("template_retrieval_query", {}))
+        if formal_candidate["contexts"]:
+            for src_ctx, retrieval_ctx in zip(formal_candidate["contexts"], retrieval_contexts):
+                src_ctx["retrieved_templates"] = list(retrieval_ctx.get("retrieved_templates", []))
+        if conservative_candidate["contexts"]:
+            for src_ctx, retrieval_ctx in zip(conservative_candidate["contexts"], retrieval_contexts):
+                src_ctx["retrieved_templates"] = list(retrieval_ctx.get("retrieved_templates", []))
+
+        llm_fallback_candidate = {
+            "ok": False,
+            "mode": "llm_fallback",
+            "fallback_level": "llm",
+            "code": "",
+            "contexts": [],
+            "snapshots": [],
+            "report": {},
+            "error": "not attempted",
+        }
+        if not self.use_template_codegen or (not formal_candidate["ok"] and not conservative_candidate["ok"]):
+            llm_fallback_candidate = self._build_llm_fallback_candidate(
+                steps=script_steps,
+                metadata=metadata,
+                expected_steps=expected_steps,
+            )
+
+        selected = formal_candidate if formal_candidate["ok"] else conservative_candidate
+        if not selected["ok"] and llm_fallback_candidate["ok"]:
+            selected = llm_fallback_candidate
+        if not selected["ok"]:
+            self._write_debug_json(
+                "formal_validation.json",
+                {
+                    "selected_mode": None,
+                    "candidates": {
+                        "formal": {
+                            "ok": formal_candidate["ok"],
+                            "error": formal_candidate["error"],
+                            "report": formal_candidate["report"],
+                        },
+                        "conservative": {
+                            "ok": conservative_candidate["ok"],
+                            "error": conservative_candidate["error"],
+                            "report": conservative_candidate["report"],
+                        },
+                        "llm_fallback": {
+                            "ok": llm_fallback_candidate["ok"],
+                            "error": llm_fallback_candidate["error"],
+                            "report": llm_fallback_candidate["report"],
+                        },
+                    },
+                },
+            )
             return self._fail_with_geometry_error(
                 state,
-                "未生成有效的正式 Manim 视频脚本。",
-                "failed to generate valid formal Manim code",
+                "模板路径未通过静态校验，且 LLM 兜底也失败；调试信息已保存到 debug/。",
+                str(
+                    formal_candidate["error"]
+                    or conservative_candidate["error"]
+                    or llm_fallback_candidate["error"]
+                    or "animation generation failed"
+                ),
             )
+
+        manim_code = str(selected["code"])
+        codegen_mode = str(selected["mode"])
+        fallback_level = str(selected["fallback_level"])
+        step_contexts = list(selected["contexts"])
+        if not step_contexts and retrieval_contexts:
+            step_contexts = retrieval_contexts
+        step_codegen_snapshots = list(selected["snapshots"])
+        validation_report = dict(selected["report"])
+        step_specs = [ctx.get("animation_spec", {}) for ctx in step_contexts]
+        template_adoption = self._summarize_template_adoption(manim_code, template_references)
+
+        self._write_debug_json("step_contexts.json", step_contexts)
+        self._write_debug_json("step_animation_specs.json", step_specs)
+        self._write_debug_json("template_reference_adoption.json", template_adoption)
+        self._write_debug_json(
+            "formal_validation.json",
+            {
+                "selected_mode": codegen_mode,
+                "selected_report": validation_report,
+                "candidates": {
+                    "formal": {
+                        "ok": formal_candidate["ok"],
+                        "error": formal_candidate["error"],
+                        "report": formal_candidate["report"],
+                    },
+                    "conservative": {
+                        "ok": conservative_candidate["ok"],
+                        "error": conservative_candidate["error"],
+                        "report": conservative_candidate["report"],
+                    },
+                        "llm_fallback": {
+                            "ok": llm_fallback_candidate["ok"],
+                            "error": llm_fallback_candidate["error"],
+                            "report": llm_fallback_candidate["report"],
+                        },
+                },
+            },
+        )
+        self._write_debug_json("error_classification.json", {"render_error_code": None})
+        self._write_debug_text("final_codegen_mode.txt", codegen_mode)
 
         class_match = re.search(r"class\s+(\w+)\s*\([^)]*Scene[^)]*\)", manim_code)
         class_name = class_match.group(1) if class_match else "MathAnimation"
@@ -784,9 +1296,48 @@ Known Entities:
             state["metadata"] = {}
         state["metadata"]["manim_code"] = manim_code
         state["metadata"]["animation_step_contexts"] = step_contexts
+        state["metadata"]["step_animation_specs"] = step_specs
+        state["metadata"]["formal_validation"] = validation_report
         state["metadata"]["manim_codegen_mode"] = codegen_mode
+        state["metadata"]["manim_code_candidates"] = {
+            "template_formal": formal_candidate["code"],
+            "template_conservative": conservative_candidate["code"],
+            "llm_fallback": llm_fallback_candidate["code"],
+        }
+        state["metadata"]["validation_candidates"] = {
+            "template_formal": formal_candidate["report"],
+            "template_conservative": conservative_candidate["report"],
+            "llm_fallback": llm_fallback_candidate["report"],
+        }
+        state["metadata"]["template_references"] = template_references
+        state["metadata"]["template_retrieval_query"] = metadata.get("template_retrieval_query", {})
+        state["metadata"]["template_retrieval_mode"] = metadata.get("template_retrieval_mode", "component_hybrid")
+        state["metadata"]["template_reference_adoption"] = template_adoption
+        state["metadata"]["fallback_level"] = fallback_level
+        state["metadata"]["render_error_code"] = None
+        state["metadata"]["geometry_ir"] = geometry_ir
+        state["metadata"]["teaching_ir"] = teaching_ir
+        state["metadata"]["problem_pattern"] = problem_pattern
+        state["metadata"]["teaching_ir_execution_check"] = execution_check
         if step_codegen_snapshots:
             state["metadata"]["animation_step_codegen_snapshots"] = step_codegen_snapshots
+
+        case_path = self.case_replay_recorder.record(
+            output_dir=self.output_dir,
+            payload={
+                "problem_text": problem_text[:240],
+                "problem_pattern": str(problem_pattern.get("problem_pattern", "")),
+                "sub_pattern": str(problem_pattern.get("sub_pattern", "")),
+                "geometry_ir_version": str(geometry_ir.get("version", "v1")),
+                "teaching_ir_version": str(teaching_ir.get("version", "v1")),
+                "execution_check": execution_check,
+                "render_result": {
+                    "status": "success",
+                    "manim_codegen_mode": codegen_mode,
+                },
+            },
+        )
+        state["metadata"]["case_record_path"] = case_path
 
         return state
 
@@ -794,6 +1345,7 @@ Known Entities:
         self,
         steps: List[ScriptStep],
         coordinate_scene_data: Optional[Dict[str, Any]],
+        teaching_ir: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         canvas_scene = CanvasScene()
         contexts: List[Dict[str, Any]] = []
@@ -801,10 +1353,16 @@ Known Entities:
         running_scene = self._build_animation_base_scene(coordinate_scene_data)
 
         for index, step in enumerate(steps, start=1):
+            teaching_step = self.teaching_ir_planner.get_step_plan(
+                teaching_ir,
+                step_id=getattr(step, "id", index),
+                fallback_index=index,
+            )
             raw_step_scene = self.scene_graph_updater.build_step_scene(
                 base_scene_graph=running_scene,
                 step=step,
                 step_index=index,
+                teaching_step=teaching_step,
             )
             step_scene = self._normalize_step_scene_geometry(
                 running_scene,
@@ -821,6 +1379,7 @@ Known Entities:
                 "step_scene": step_scene,
                 "animation_plan": plan,
                 "canvas_layout": layout,
+                "teaching_step": teaching_step,
             })
             cumulative += plan["duration"]
 
@@ -831,7 +1390,12 @@ Known Entities:
         project: VideoProject,
         steps: List[ScriptStep],
         coordinate_scene_data: Optional[Dict[str, Any]],
-    ) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        teaching_ir: Optional[Dict[str, Any]] = None,
+        *,
+        expected_steps: List[Dict[str, Any]],
+        conservative: bool,
+        adaptive_plan: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         canvas_scene = CanvasScene()
         cumulative = 0.0
         contexts: List[Dict[str, Any]] = []
@@ -842,10 +1406,16 @@ Known Entities:
         running_scene = base_coordinate_scene
 
         for index, step in enumerate(steps, start=1):
+            teaching_step = self.teaching_ir_planner.get_step_plan(
+                teaching_ir,
+                step_id=getattr(step, "id", index),
+                fallback_index=index,
+            )
             raw_step_scene = self.scene_graph_updater.build_step_scene(
                 base_scene_graph=running_scene,
                 step=step,
                 step_index=index,
+                teaching_step=teaching_step,
             )
             step_scene = self._normalize_step_scene_geometry(
                 running_scene,
@@ -862,21 +1432,66 @@ Known Entities:
                 "step_scene": step_scene,
                 "animation_plan": plan,
                 "canvas_layout": layout,
+                "teaching_step": teaching_step,
             }
             contexts.append(ctx)
 
-            manim_code = self.template_codegen.generate(
-                project=project,
-                coordinate_scene_data=base_coordinate_scene,
-                step_contexts=contexts,
-            )
-            self._ensure_presentable_video_code(manim_code)
-            snapshots.append({
+            if self.export_incremental_codegen_debug:
+                self._attach_animation_specs(
+                    contexts,
+                    base_coordinate_scene=base_coordinate_scene,
+                    conservative=conservative,
+                    adaptive_plan=adaptive_plan,
+                )
+            snapshot = {
                 "step_id": step.id,
-                "code_length": len(manim_code),
-                "debug_code_path": self._export_step_debug_code(index, manim_code),
+                "code_length": None,
+                "debug_code_path": None,
                 "context": ctx,
-            })
+            }
+            if self.export_incremental_codegen_debug:
+                partial_code = self.template_codegen.generate(
+                    project=project,
+                    coordinate_scene_data=base_coordinate_scene,
+                    step_contexts=contexts,
+                )
+                self._ensure_presentable_video_code(
+                    partial_code,
+                    expected_steps=expected_steps[: len(contexts)],
+                )
+                snapshot["code_length"] = len(partial_code)
+                snapshot["debug_code_path"] = self._export_step_debug_code(
+                    index,
+                    partial_code,
+                    "conservative" if conservative else "formal",
+                )
+            snapshots.append(snapshot)
             cumulative += plan["duration"]
+
+        if not self.export_incremental_codegen_debug:
+            self._attach_animation_specs(
+                contexts,
+                base_coordinate_scene=base_coordinate_scene,
+                conservative=conservative,
+                adaptive_plan=adaptive_plan,
+            )
+
+        manim_code = self.template_codegen.generate(
+            project=project,
+            coordinate_scene_data=base_coordinate_scene,
+            step_contexts=contexts,
+        )
+        self._ensure_presentable_video_code(
+            manim_code,
+            expected_steps=expected_steps,
+        )
+        if snapshots:
+            snapshots[-1]["code_length"] = len(manim_code)
+            if not snapshots[-1].get("debug_code_path"):
+                snapshots[-1]["debug_code_path"] = self._export_step_debug_code(
+                    len(contexts),
+                    manim_code,
+                    "conservative" if conservative else "formal",
+                )
 
         return manim_code, contexts, snapshots

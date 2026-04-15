@@ -15,6 +15,10 @@ from .coordinate_scene import CoordinateSceneCompiler, CoordinateSceneError
 from .geometry_fact_compiler import GeometryFactCompiler
 from .graph_builder import GeometryGraph
 from .scene_graph import SceneGraph
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
 
 
 class VisionAgent(BaseAgent):
@@ -29,7 +33,7 @@ class VisionAgent(BaseAgent):
     def __init__(self, config: Dict[str, Any], llm: Optional[Any] = None):
         super().__init__(config, llm)
         self.system_prompt = config.get("system_prompt", self.SYSTEM_PROMPT)
-        self.output_dir = config.get("output_dir", "./output")
+        self.output_dir = config.get("output_dir", str(DEFAULT_OUTPUT_DIR))
         self.export_ggb = bool(config.get("export_ggb", True))
         self.geometry_fact_compiler = GeometryFactCompiler()
         self.coordinate_scene_compiler = CoordinateSceneCompiler()
@@ -58,6 +62,7 @@ class VisionAgent(BaseAgent):
         bundle = self._analyze_problem_bundle(image_path)
         if self._bundle_is_effectively_empty(bundle):
             bundle = self._recover_problem_bundle(image_path, bundle)
+        bundle = self._stabilize_problem_bundle(bundle, image_path=image_path)
         problem_text = project.problem_text or str(bundle.get("problem_text", "")).strip()
         raw_geometry_facts = bundle.get("geometry_facts")
         legacy_geometry_spec = bundle.get("geometry_spec")
@@ -441,6 +446,733 @@ Return exactly:
             )
 
         return recovered
+
+    def _stabilize_problem_bundle(
+        self,
+        bundle: Optional[Dict[str, Any]],
+        *,
+        image_path: str,
+    ) -> Dict[str, Any]:
+        stabilized = copy.deepcopy(bundle or {})
+        problem_text = str(stabilized.get("problem_text", "")).strip()
+        geometry_facts = stabilized.get("geometry_facts")
+        if not isinstance(geometry_facts, dict):
+            geometry_facts = {}
+
+        if not problem_text:
+            problem_text = self._extract_problem_text_fallback(image_path)
+        geometry_facts = self._sanitize_geometry_facts(geometry_facts, problem_text=problem_text)
+
+        if not self._geometry_facts_have_content(geometry_facts):
+            fallback = self._extract_geometry_facts_fallback(
+                image_path=image_path,
+                problem_text=problem_text,
+            )
+            geometry_facts = self._sanitize_geometry_facts(fallback, problem_text=problem_text)
+
+        stabilized["problem_text"] = problem_text
+        stabilized["geometry_facts"] = geometry_facts
+        return stabilized
+
+    def _sanitize_geometry_facts(
+        self,
+        geometry_facts: Optional[Dict[str, Any]],
+        *,
+        problem_text: str,
+    ) -> Dict[str, Any]:
+        facts = copy.deepcopy(geometry_facts or {})
+        sanitized: Dict[str, Any] = {
+            "confidence": self._safe_float(facts.get("confidence"), default=0.0),
+            "ambiguities": [
+                str(item).strip()
+                for item in (facts.get("ambiguities") or [])
+                if str(item).strip()
+            ],
+            "roles": facts.get("roles") if isinstance(facts.get("roles"), dict) else {},
+            "points": [],
+            "segments": [],
+            "polygons": [],
+            "circles": [],
+            "arcs": [],
+            "angles": [],
+            "right_angles": [],
+            "relations": [],
+            "measurements": [],
+        }
+
+        points = self._ordered_unique_tokens(
+            list(self._iter_point_tokens(facts.get("points")))
+            + list(self._iter_problem_text_points(problem_text))
+        )
+        point_set = set(points)
+        sanitized["points"] = points
+
+        segments = self._ordered_unique_tokens(
+            list(self._iter_segment_tokens(facts.get("segments")))
+            + self._infer_problem_text_segments(problem_text, point_set)
+        )
+        segment_set = set(segments)
+        sanitized["segments"] = segments
+
+        polygons = self._ordered_unique_tokens(
+            list(self._iter_polygon_tokens(facts.get("polygons")))
+            + self._infer_problem_text_polygons(problem_text, point_set)
+        )
+        sanitized["polygons"] = polygons
+
+        circles = self._sanitize_circle_bucket(
+            facts.get("circles"),
+            point_set=point_set,
+        )
+        sanitized["circles"] = circles
+
+        circle_ref_map: Dict[str, str] = {}
+        for item in circles:
+            circle_id = str(item.get("id", "")).strip()
+            center = str(item.get("center", "")).strip()
+            if circle_id:
+                circle_ref_map[circle_id] = circle_id
+            if center:
+                circle_ref_map[center] = circle_id or center
+
+        arcs = self._sanitize_arc_bucket(
+            facts.get("arcs"),
+            point_set=point_set,
+            circle_ref_map=circle_ref_map,
+        )
+        sanitized["arcs"] = arcs
+
+        # Ensure circle/arc referenced points are retained with deterministic ordering.
+        sanitized["points"] = self._merge_ordered_points(sanitized["points"], point_set)
+
+        sanitized["angles"] = self._sanitize_angle_bucket(
+            facts.get("angles"),
+            point_set=point_set,
+        )
+        sanitized["right_angles"] = self._sanitize_angle_bucket(
+            facts.get("right_angles"),
+            point_set=point_set,
+            force_right=True,
+        )
+        sanitized["relations"] = self._sanitize_relation_bucket(
+            facts.get("relations"),
+            point_set=point_set,
+            segment_set=segment_set,
+            circle_ref_map=circle_ref_map,
+        )
+        sanitized["measurements"] = self._sanitize_measurement_bucket(
+            facts.get("measurements"),
+            point_set=point_set,
+            segment_set=segment_set,
+        )
+
+        self._augment_facts_from_problem_text(
+            sanitized,
+            problem_text=problem_text,
+            point_set=point_set,
+            segment_set=segment_set,
+        )
+        sanitized["points"] = self._merge_ordered_points(sanitized["points"], point_set)
+        return sanitized
+
+    def _iter_point_tokens(self, raw: Any):
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                token = self._normalize_point_token(item if not isinstance(item, dict) else item.get("id") or item.get("label") or item.get("name"))
+                if token:
+                    yield token
+
+    def _iter_problem_text_points(self, text: str):
+        normalized = self._normalize_prime_markers(text)
+        for token in re.findall(r"[A-Z]\d*'*", normalized):
+            point = self._normalize_point_token(token)
+            if point:
+                yield point
+
+    def _iter_segment_tokens(self, raw: Any):
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                token = self._normalize_segment_token(item if not isinstance(item, dict) else item.get("id") or item.get("segment") or item.get("label"))
+                if token:
+                    yield token
+
+    def _iter_polygon_tokens(self, raw: Any):
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                token = self._normalize_polygon_token(item if not isinstance(item, dict) else item.get("id") or item.get("polygon") or item.get("label"))
+                if token:
+                    yield token
+
+    def _sanitize_angle_bucket(
+        self,
+        raw_bucket: Any,
+        *,
+        point_set: set,
+        force_right: bool = False,
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw in (raw_bucket or []):
+            if not isinstance(raw, dict):
+                continue
+            vertex = self._normalize_point_token(raw.get("vertex"))
+            refs: List[str] = []
+            sides = raw.get("sides")
+            if vertex and isinstance(sides, (list, tuple)) and len(sides) == 2:
+                for side in sides:
+                    endpoints = self._segment_endpoints_from_token(side)
+                    if len(endpoints) == 2 and vertex in endpoints:
+                        refs.append(endpoints[0] if endpoints[1] == vertex else endpoints[1])
+
+            if len(refs) != 2:
+                angle_points = self._extract_angle_points_from_text(
+                    raw.get("angle")
+                    or raw.get("name")
+                    or raw.get("label")
+                    or raw.get("description")
+                    or ""
+                )
+                if len(angle_points) == 3:
+                    refs = [angle_points[0], angle_points[2]]
+                    vertex = vertex or angle_points[1]
+
+            if len(refs) == 2 and vertex:
+                point_set.add(vertex)
+                point_set.add(refs[0])
+                point_set.add(refs[1])
+
+            if len(refs) == 2 and vertex and vertex in point_set and refs[0] in point_set and refs[1] in point_set:
+                payload = {"vertex": vertex, "sides": [self._normalize_segment_token(vertex + refs[0]), self._normalize_segment_token(vertex + refs[1])]}
+                for key in ("name", "label", "description"):
+                    if str(raw.get(key, "")).strip():
+                        payload[key] = str(raw.get(key)).strip()
+                        break
+                signature = (vertex, tuple(sorted(refs)), force_right)
+                if signature not in seen:
+                    seen.add(signature)
+                    result.append(payload)
+        return result
+
+    def _sanitize_circle_bucket(
+        self,
+        raw_bucket: Any,
+        *,
+        point_set: set,
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw in (raw_bucket or []):
+            circle_id = ""
+            center = ""
+            radius_point = ""
+            points_on_circle: List[str] = []
+
+            if isinstance(raw, str):
+                center = self._normalize_circle_center_token(raw)
+            elif isinstance(raw, dict):
+                circle_id = self._normalize_circle_id(raw.get("id") or raw.get("circle") or raw.get("circle_id"))
+                center = self._normalize_point_token(raw.get("center") or raw.get("origin") or raw.get("o"))
+                if not center:
+                    center = self._normalize_circle_center_token(raw.get("label") or raw.get("name") or raw.get("id"))
+                radius_point = self._normalize_point_token(raw.get("radius_point") or raw.get("point"))
+                points_on_circle = [
+                    self._normalize_point_token(item)
+                    for item in self._extract_points_from_any(
+                        raw.get("points_on_circle")
+                        or raw.get("points")
+                        or raw.get("on_points")
+                        or raw.get("entities")
+                    )
+                ]
+                points_on_circle = [item for item in points_on_circle if item and item != center]
+
+            if not center:
+                continue
+            if not circle_id:
+                circle_id = f"circle_{center}"
+
+            if center:
+                point_set.add(center)
+            if radius_point:
+                point_set.add(radius_point)
+            for point_id in points_on_circle:
+                point_set.add(point_id)
+
+            payload: Dict[str, Any] = {"id": circle_id, "center": center}
+            if radius_point and radius_point != center:
+                payload["radius_point"] = radius_point
+            unique_circle_points = self._ordered_unique_tokens(points_on_circle)
+            if unique_circle_points:
+                payload["points_on_circle"] = unique_circle_points
+
+            signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result.append(payload)
+        return result
+
+    def _sanitize_arc_bucket(
+        self,
+        raw_bucket: Any,
+        *,
+        point_set: set,
+        circle_ref_map: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw in (raw_bucket or []):
+            arc_id = ""
+            center = ""
+            circle_ref = ""
+            endpoints: List[str] = []
+
+            if isinstance(raw, str):
+                refs = [self._normalize_point_token(item) for item in self._extract_points_from_any(raw)]
+                endpoints = [item for item in refs if item][:2]
+            elif isinstance(raw, dict):
+                arc_id = str(raw.get("id") or "").strip().replace(" ", "_")
+                center = self._normalize_point_token(raw.get("center") or raw.get("origin"))
+                circle_ref = self._resolve_circle_ref(
+                    raw.get("circle") or raw.get("circle_id"),
+                    circle_ref_map,
+                )
+                refs = [
+                    self._normalize_point_token(item)
+                    for item in self._extract_points_from_any(
+                        raw.get("points")
+                        or raw.get("endpoints")
+                        or [raw.get("start"), raw.get("end")]
+                        or raw.get("entities")
+                    )
+                ]
+                endpoints = [item for item in refs if item][:2]
+
+            if len(endpoints) != 2:
+                continue
+
+            for point_id in endpoints:
+                point_set.add(point_id)
+            if center:
+                point_set.add(center)
+
+            if not arc_id:
+                arc_id = f"arc_{endpoints[0]}{endpoints[1]}"
+
+            payload: Dict[str, Any] = {
+                "id": arc_id,
+                "points": endpoints,
+            }
+            if center:
+                payload["center"] = center
+            if circle_ref:
+                payload["circle"] = circle_ref
+
+            signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result.append(payload)
+        return result
+
+    def _sanitize_relation_bucket(
+        self,
+        raw_bucket: Any,
+        *,
+        point_set: set,
+        segment_set: set,
+        circle_ref_map: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        allowed = {
+            "point_on_segment",
+            "point_on_circle",
+            "collinear",
+            "perpendicular",
+            "parallel",
+            "midpoint",
+            "equal_length",
+            "intersect",
+        }
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw in (raw_bucket or []):
+            if not isinstance(raw, dict):
+                continue
+            relation_type = str(raw.get("type", "")).strip().lower()
+            if relation_type not in allowed:
+                continue
+            item = None
+            entity_refs = [str(item).strip() for item in (raw.get("entities") or []) if str(item).strip()]
+            if relation_type == "point_on_segment":
+                point_id = self._normalize_point_token(raw.get("point") or (entity_refs[0] if entity_refs else ""))
+                segment_raw = raw.get("segment") or raw.get("line") or (entity_refs[1] if len(entity_refs) >= 2 else "")
+                segment_id = self._normalize_segment_token(segment_raw)
+                if point_id and point_id in point_set and segment_id:
+                    item = {"type": relation_type, "point": point_id, "segment": segment_id}
+            elif relation_type == "collinear":
+                raw_points = raw.get("points") or entity_refs
+                pts = [self._normalize_point_token(item) for item in raw_points]
+                pts = [item for item in pts if item and item in point_set]
+                if len(dict.fromkeys(pts)) == 3:
+                    item = {"type": relation_type, "points": list(dict.fromkeys(pts))}
+            elif relation_type in {"parallel", "perpendicular", "equal_length"}:
+                raw_segments = raw.get("segments") or raw.get("lines") or entity_refs
+                segs = [self._normalize_segment_token(item) for item in raw_segments]
+                segs = [item for item in segs if item]
+                if relation_type == "equal_length" and len(segs) >= 2:
+                    item = {"type": relation_type, "segments": list(dict.fromkeys(segs))}
+                elif len(dict.fromkeys(segs)) == 2:
+                    item = {"type": relation_type, "segments": list(dict.fromkeys(segs))}
+            elif relation_type == "midpoint":
+                point_id = self._normalize_point_token(raw.get("point") or raw.get("midpoint") or (entity_refs[0] if entity_refs else ""))
+                segment_raw = raw.get("segment") or raw.get("line") or (entity_refs[1] if len(entity_refs) >= 2 else "")
+                segment_id = self._normalize_segment_token(segment_raw)
+                if point_id and point_id in point_set and segment_id:
+                    item = {"type": relation_type, "point": point_id, "segment": segment_id}
+            elif relation_type == "intersect":
+                point_id = self._normalize_point_token(raw.get("point") or raw.get("intersection") or (entity_refs[0] if entity_refs else ""))
+                raw_segments = raw.get("segments") or raw.get("lines") or entity_refs[1:]
+                segs = [self._normalize_segment_token(item) for item in raw_segments]
+                segs = [item for item in segs if item]
+                if point_id and point_id in point_set and len(dict.fromkeys(segs)) == 2:
+                    item = {"type": relation_type, "point": point_id, "segments": list(dict.fromkeys(segs))}
+            elif relation_type == "point_on_circle":
+                point_id = self._normalize_point_token(raw.get("point") or (entity_refs[0] if entity_refs else ""))
+                circle_raw = raw.get("circle") or raw.get("circle_id") or (entity_refs[1] if len(entity_refs) >= 2 else "")
+                circle_id = self._resolve_circle_ref(circle_raw, circle_ref_map)
+                if point_id and point_id in point_set and circle_id:
+                    item = {"type": relation_type, "point": point_id, "circle": circle_id}
+
+            if not item:
+                continue
+            signature = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result.append(item)
+        return result
+
+    def _sanitize_measurement_bucket(
+        self,
+        raw_bucket: Any,
+        *,
+        point_set: set,
+        segment_set: set,
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw in (raw_bucket or []):
+            if not isinstance(raw, dict):
+                continue
+            measurement_type = str(raw.get("type", "")).strip().lower()
+            item = None
+            if measurement_type == "length":
+                segment_id = self._normalize_segment_token(raw.get("segment") or raw.get("line"))
+                if not segment_id:
+                    entities = [str(item).strip() for item in (raw.get("entities") or []) if str(item).strip()]
+                    if len(entities) == 2:
+                        segment_id = self._normalize_segment_token("".join(entities))
+                value = self._extract_numeric_or_symbolic_value(raw.get("value"))
+                if segment_id and value is not None:
+                    item = {"type": "length", "segment": segment_id, "value": value}
+            elif measurement_type == "angle":
+                value = self._extract_angle_value(raw.get("value"))
+                angle_name = self._normalize_angle_name(raw.get("angle") or raw.get("name") or raw.get("label"))
+                vertex = self._normalize_point_token(raw.get("vertex"))
+                if angle_name and value is not None:
+                    item = {"type": "angle", "angle": angle_name, "value": value}
+                elif vertex and value is not None:
+                    payload = {"type": "angle", "vertex": vertex, "value": value}
+                    if str(raw.get("description", "")).strip():
+                        payload["description"] = str(raw.get("description")).strip()
+                    item = payload
+                else:
+                    entities = [
+                        self._normalize_point_token(entity)
+                        for entity in (raw.get("entities") or [])
+                    ]
+                    entities = [entity for entity in entities if entity]
+                    if len(entities) == 3 and value is not None:
+                        item = {"type": "angle", "entities": entities, "value": value}
+            elif measurement_type == "ratio":
+                value = self._extract_numeric_or_symbolic_value(raw.get("value"))
+                raw_segments = raw.get("segments") or raw.get("lines") or raw.get("entities") or []
+                segs = [self._normalize_segment_token(item) for item in raw_segments]
+                segs = [item for item in segs if item]
+                if len(segs) >= 2 and value is not None:
+                    item = {"type": "ratio", "segments": segs[:2], "value": value}
+            if not item:
+                continue
+            signature = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result.append(item)
+        return result
+
+    def _augment_facts_from_problem_text(
+        self,
+        facts: Dict[str, Any],
+        *,
+        problem_text: str,
+        point_set: set,
+        segment_set: set,
+    ) -> None:
+        normalized = self._normalize_prime_markers(problem_text)
+
+        for match in re.finditer(r"[⊙○]\s*([A-Z]\d*'*)", normalized):
+            center = self._normalize_point_token(match.group(1))
+            if not center:
+                continue
+            point_set.add(center)
+            if center not in facts["points"]:
+                facts["points"].append(center)
+            circle_payload = {"id": f"circle_{center}", "center": center}
+            if circle_payload not in facts["circles"]:
+                facts["circles"].append(circle_payload)
+
+        for match in re.finditer(r"([A-Z]\d*'*)\s*(?:在|属于)?\s*[⊙○]\s*([A-Z]\d*'*)\s*(?:上|内)?", normalized):
+            point_id = self._normalize_point_token(match.group(1))
+            center = self._normalize_point_token(match.group(2))
+            if not point_id or not center:
+                continue
+            point_set.add(point_id)
+            point_set.add(center)
+            if point_id not in facts["points"]:
+                facts["points"].append(point_id)
+            if center not in facts["points"]:
+                facts["points"].append(center)
+            circle_id = f"circle_{center}"
+            circle_payload = {"id": circle_id, "center": center}
+            if circle_payload not in facts["circles"]:
+                facts["circles"].append(circle_payload)
+            relation_payload = {"type": "point_on_circle", "point": point_id, "circle": circle_id}
+            if relation_payload not in facts["relations"]:
+                facts["relations"].append(relation_payload)
+
+        if "菱形" in normalized:
+            for match in re.finditer(r"菱形\s*([A-Z]\d*'*)([A-Z]\d*'*)([A-Z]\d*'*)([A-Z]\d*'*)", normalized):
+                refs = [self._normalize_point_token(token) for token in match.groups()]
+                refs = [item for item in refs if item]
+                if len(refs) != 4:
+                    continue
+                polygon = "".join(refs)
+                if polygon not in facts["polygons"]:
+                    facts["polygons"].append(polygon)
+                for first, second in zip(refs, refs[1:] + refs[:1]):
+                    seg = self._normalize_segment_token(first + second)
+                    if seg and seg not in facts["segments"]:
+                        facts["segments"].append(seg)
+                parallels = [
+                    {"type": "parallel", "segments": [self._normalize_segment_token(refs[0] + refs[1]), self._normalize_segment_token(refs[2] + refs[3])]},
+                    {"type": "parallel", "segments": [self._normalize_segment_token(refs[1] + refs[2]), self._normalize_segment_token(refs[3] + refs[0])]},
+                    {"type": "equal_length", "segments": [self._normalize_segment_token(refs[0] + refs[1]), self._normalize_segment_token(refs[1] + refs[2])]},
+                    {"type": "equal_length", "segments": [self._normalize_segment_token(refs[1] + refs[2]), self._normalize_segment_token(refs[2] + refs[3])]},
+                    {"type": "equal_length", "segments": [self._normalize_segment_token(refs[2] + refs[3]), self._normalize_segment_token(refs[3] + refs[0])]},
+                ]
+                for relation in parallels:
+                    if relation not in facts["relations"]:
+                        facts["relations"].append(relation)
+
+        for match in re.finditer(r"沿\s*([A-Z]\d*'*[A-Z]\d*'*)\s*(?:折叠|翻折)", normalized):
+            seg = self._normalize_segment_token(match.group(1))
+            if seg and seg not in facts["segments"]:
+                facts["segments"].append(seg)
+
+        for match in re.finditer(r"([A-Z]\d*'*)\s*=\s*([-+]?\d+(?:\.\d+)?)", normalized):
+            token = self._normalize_segment_token(match.group(1))
+            if token:
+                payload = {"type": "length", "segment": token, "value": self._safe_float(match.group(2), default=None)}
+                if payload["value"] is not None and payload not in facts["measurements"]:
+                    facts["measurements"].append(payload)
+
+        for match in re.finditer(r"tan\s*([A-Z]\d*'*)\s*=\s*([-+]?\d+(?:\.\d+)?)", normalized, flags=re.IGNORECASE):
+            angle_name = self._normalize_angle_name("∠" + match.group(1))
+            if angle_name:
+                payload = {"type": "angle", "angle": angle_name, "value": f"arctan({match.group(2)})"}
+                if payload not in facts["measurements"]:
+                    facts["measurements"].append(payload)
+
+        for match in re.finditer(r"∠\s*([A-Z]\d*'*(?:[A-Z]\d*'*){2})\s*=\s*([-+]?\d+(?:\.\d+)?)", normalized):
+            angle_name = self._normalize_angle_name("∠" + match.group(1))
+            value = self._safe_float(match.group(2), default=None)
+            if angle_name and value is not None:
+                payload = {"type": "angle", "angle": angle_name, "value": value}
+                if payload not in facts["measurements"]:
+                    facts["measurements"].append(payload)
+
+    def _infer_problem_text_segments(self, text: str, point_set: set) -> List[str]:
+        normalized = self._normalize_prime_markers(text)
+        result: List[str] = []
+        for first, second in re.findall(r"([A-Z]\d*'*)([A-Z]\d*'*)", normalized):
+            segment = self._normalize_segment_token(first + second)
+            if segment:
+                result.append(segment)
+        return result
+
+    def _infer_problem_text_polygons(self, text: str, point_set: set) -> List[str]:
+        normalized = self._normalize_prime_markers(text)
+        result: List[str] = []
+        for match in re.finditer(r"(?:菱形|平行四边形|四边形|△|三角形)?\s*([A-Z]\d*'*(?:[A-Z]\d*'*){2,3})", normalized):
+            token = self._normalize_polygon_token(match.group(1))
+            if token:
+                result.append(token)
+        return result
+
+    def _normalize_point_token(self, raw: Any) -> str:
+        text = self._normalize_prime_markers(raw).strip().replace(" ", "")
+        if not text:
+            return ""
+        if re.fullmatch(r"[A-Za-z]\d*'*", text):
+            return text[0].upper() + text[1:]
+        return ""
+
+    def _normalize_segment_token(self, raw: Any) -> str:
+        text = self._normalize_prime_markers(raw).strip().replace(" ", "")
+        if text.startswith("seg_"):
+            text = text[4:]
+        refs = re.findall(r"[A-Za-z]\d*'*", text)
+        if len(refs) == 2 and "".join(refs) == text:
+            return refs[0][0].upper() + refs[0][1:] + refs[1][0].upper() + refs[1][1:]
+        return ""
+
+    def _normalize_polygon_token(self, raw: Any) -> str:
+        text = self._normalize_prime_markers(raw).strip().replace(" ", "")
+        refs = re.findall(r"[A-Za-z]\d*'*", text)
+        if len(refs) >= 3 and "".join(refs) == text:
+            return "".join(ref[0].upper() + ref[1:] for ref in refs)
+        return ""
+
+    def _normalize_circle_center_token(self, raw: Any) -> str:
+        text = self._normalize_prime_markers(raw).strip().replace(" ", "")
+        if not text:
+            return ""
+        marker_match = re.search(r"[⊙○]([A-Za-z]\d*'*)", text)
+        if marker_match:
+            return self._normalize_point_token(marker_match.group(1))
+        if text.lower().startswith("circle_"):
+            return self._normalize_point_token(text.split("_", 1)[1])
+        refs = re.findall(r"[A-Za-z]\d*'*", text)
+        if len(refs) == 1:
+            return self._normalize_point_token(refs[0])
+        return ""
+
+    def _normalize_circle_id(self, raw: Any) -> str:
+        text = str(raw or "").strip().replace(" ", "_")
+        if not text:
+            return ""
+        return self._normalize_prime_markers(text)
+
+    def _resolve_circle_ref(self, raw: Any, circle_ref_map: Dict[str, str]) -> str:
+        direct = self._normalize_circle_id(raw)
+        if direct and direct in circle_ref_map:
+            return circle_ref_map[direct]
+        center = self._normalize_circle_center_token(raw)
+        if center and center in circle_ref_map:
+            return circle_ref_map[center]
+        return direct or center
+
+    def _extract_points_from_any(self, raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            normalized = self._normalize_prime_markers(raw)
+            return re.findall(r"[A-Za-z]\d*'*", normalized)
+        if isinstance(raw, dict):
+            for key in ("points", "endpoints", "entities", "vertices"):
+                if raw.get(key) is not None:
+                    return self._extract_points_from_any(raw.get(key))
+            for key in ("id", "label", "name"):
+                if raw.get(key) is not None:
+                    return self._extract_points_from_any(raw.get(key))
+            return []
+        if isinstance(raw, (list, tuple)):
+            result: List[str] = []
+            for item in raw:
+                result.extend(self._extract_points_from_any(item))
+            return result
+        return []
+
+    def _segment_endpoints_from_token(self, raw: Any) -> List[str]:
+        text = self._normalize_prime_markers(raw).strip().replace(" ", "")
+        if text.startswith("seg_"):
+            text = text[4:]
+        refs = re.findall(r"[A-Za-z]\d*'*", text)
+        if len(refs) == 2 and "".join(refs) == text:
+            return [refs[0][0].upper() + refs[0][1:], refs[1][0].upper() + refs[1][1:]]
+        return []
+
+    def _normalize_angle_name(self, raw: Any) -> str:
+        text = self._normalize_prime_markers(raw).strip().replace(" ", "")
+        if not text:
+            return ""
+        if not text.startswith("∠"):
+            text = "∠" + text
+        refs = re.findall(r"[A-Za-z]\d*'*", text)
+        if len(refs) in {1, 3}:
+            return "∠" + "".join(ref[0].upper() + ref[1:] for ref in refs)
+        return ""
+
+    def _extract_angle_points_from_text(self, raw: Any) -> List[str]:
+        text = self._normalize_prime_markers(raw).strip()
+        if not text:
+            return []
+        match = re.search(r"(?:∠|angle)?\s*([A-Za-z]\d*'*(?:[A-Za-z]\d*'*){2})", text, flags=re.IGNORECASE)
+        if not match:
+            return []
+        refs = [self._normalize_point_token(item) for item in re.findall(r"[A-Za-z]\d*'*", match.group(1))]
+        refs = [item for item in refs if item]
+        if len(refs) == 3:
+            return refs
+        return []
+
+    def _extract_angle_value(self, raw: Any) -> Any:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        arctan_match = re.search(r"arctan\(\s*[-+]?\d+(?:\.\d+)?\s*\)", text, flags=re.IGNORECASE)
+        if arctan_match:
+            return arctan_match.group(0)
+        numeric = self._safe_float(text, default=None)
+        if numeric is not None:
+            return numeric
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+        if match and ("tan" in text.lower() or "arctan" in text.lower()):
+            return f"arctan({match.group(0)})"
+        return None
+
+    def _extract_numeric_or_symbolic_value(self, raw: Any) -> Any:
+        numeric = self._safe_float(raw, default=None)
+        if numeric is not None:
+            return numeric
+        text = str(raw or "").strip()
+        return text if text else None
+
+    def _ordered_unique_tokens(self, values: List[str]) -> List[str]:
+        seen = set()
+        ordered: List[str] = []
+        for value in values:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered
+
+    def _merge_ordered_points(self, existing_points: List[str], point_set: set) -> List[str]:
+        ordered = self._ordered_unique_tokens(list(existing_points or []))
+        seen = set(ordered)
+        extras = sorted(item for item in point_set if item and item not in seen)
+        ordered.extend(extras)
+        return ordered
+
+    def _safe_float(self, raw: Any, default: Optional[float]) -> Optional[float]:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _normalize_prime_markers(self, raw: Any) -> str:
+        return str(raw or "").replace("′", "'").replace("’", "'").replace("`", "'")
 
     def _extract_problem_text_fallback(self, image_path: str) -> str:
         prompt = (
@@ -1012,21 +1744,29 @@ Be conservative. If uncertain, omit instead of guessing.
         return self.parse_geometry_spec(image_path)
 
     def _parse_json_like_output(self, result: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            match = re.search(r"```json\s*([\s\S]*?)\s*```", result)
-            if match:
-                try:
-                    return json.loads(match.group(1).strip())
-                except json.JSONDecodeError:
-                    pass
+        candidates = [result]
+        match = re.search(r"```json\s*([\s\S]*?)\s*```", result)
+        if match:
+            candidates.append(match.group(1).strip())
+        brace_match = re.search(r"\{[\s\S]*\}", result)
+        if brace_match:
+            candidates.append(brace_match.group(0))
 
-            brace_match = re.search(r"\{[\s\S]*\}", result)
-            if brace_match:
+        for candidate in candidates:
+            for variant in (candidate, self._clean_json_like_text(candidate)):
                 try:
-                    return json.loads(brace_match.group(0))
+                    return json.loads(variant)
                 except json.JSONDecodeError:
-                    pass
-
+                    continue
         return fallback
+
+    def _clean_json_like_text(self, text: str) -> str:
+        cleaned = str(text or "")
+        cleaned = re.sub(r"```json\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("```", "")
+        cleaned = re.sub(r"//.*?$", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"/\*[\s\S]*?\*/", "", cleaned)
+        cleaned = re.sub(r"(\})(\s*\{)", r"\1,\2", cleaned)
+        cleaned = re.sub(r"(\])(\s*\{)", r"\1,\2", cleaned)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        return cleaned.strip()

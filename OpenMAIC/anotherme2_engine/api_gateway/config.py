@@ -4,6 +4,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
+
+try:
+    from env_loader import load_project_env
+except ModuleNotFoundError:
+    from anotherme2_engine.env_loader import load_project_env
+
+
+load_project_env()
 
 
 @dataclass(frozen=True)
@@ -13,12 +22,17 @@ class Settings:
     app_host: str = os.getenv("GATEWAY_HOST", "0.0.0.0")
     app_port: int = int(os.getenv("GATEWAY_PORT", "8080"))
 
-    database_url: str = os.getenv("GATEWAY_DATABASE_URL", "sqlite:///./gateway.db")
+    database_url: str = os.getenv(
+        "GATEWAY_DATABASE_URL",
+        "postgresql+psycopg://postgres:postgres@localhost:5432/anotherme2",
+    )
 
     redis_url: str = os.getenv("GATEWAY_REDIS_URL", "redis://localhost:6379/0")
+    queue_backend: Literal["auto", "redis", "polling"] = os.getenv("GATEWAY_QUEUE_BACKEND", "auto")  # type: ignore[assignment]
     queue_course: str = os.getenv("GATEWAY_QUEUE_COURSE", "q.course")
     queue_problem_video: str = os.getenv("GATEWAY_QUEUE_PROBLEM_VIDEO", "q.problem_video")
     queue_package: str = os.getenv("GATEWAY_QUEUE_PACKAGE", "q.package")
+    queue_learning_record: str = os.getenv("GATEWAY_QUEUE_LEARNING_RECORD", "q.learning_record")
     queue_dead_letter_prefix: str = os.getenv("GATEWAY_DLQ_PREFIX", "q.dlq")
     max_retries: int = int(os.getenv("GATEWAY_MAX_RETRIES", "2"))
     retry_base_seconds: int = int(os.getenv("GATEWAY_RETRY_BASE_SECONDS", "5"))
@@ -47,13 +61,19 @@ class Settings:
             "course_generate": self.queue_course,
             "problem_video_generate": self.queue_problem_video,
             "study_package_generate": self.queue_package,
+            "learning_record_extract": self.queue_learning_record,
         }
 
     @property
     def dlq_mapping(self) -> dict[str, str]:
         return {
             queue: f"{self.queue_dead_letter_prefix}.{queue}"
-            for queue in [self.queue_course, self.queue_problem_video, self.queue_package]
+            for queue in [
+                self.queue_course,
+                self.queue_problem_video,
+                self.queue_package,
+                self.queue_learning_record,
+            ]
         }
 
 

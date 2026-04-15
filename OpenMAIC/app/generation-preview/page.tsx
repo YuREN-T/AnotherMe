@@ -799,7 +799,7 @@ export function GenerationPreviewContent() {
 
       sessionStorage.removeItem('generationSession');
       await store.saveToStorage();
-      router.push(`/workspace/classroom/${stage.id}`);
+      router.push(`/classroom/${stage.id}`);
     } catch (err) {
       // AbortError is expected when navigating away — don't show as error
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -832,8 +832,8 @@ export function GenerationPreviewContent() {
         <div className="space-y-4 text-center text-[rgba(100,79,53,0.8)]">
           <div className="mx-auto size-10 rounded-full border-2 border-[rgba(131,101,61,0.26)] border-t-[rgba(83,61,31,0.92)] animate-spin" />
           <div className="space-y-1">
-            <p className="font-serif text-xl text-[rgba(52,39,20,0.96)]">正在恢复生成会话</p>
-            <p className="text-sm">为你取回上一次的课堂生成进度。</p>
+            <p className="font-serif text-xl text-[rgba(52,39,20,0.96)]">正在准备学习内容</p>
+            <p className="text-sm">请稍等，马上进入生成流程。</p>
           </div>
         </div>
       </div>
@@ -851,10 +851,10 @@ export function GenerationPreviewContent() {
             </div>
             <div className="space-y-2">
               <h2 className="font-serif text-[30px] font-semibold tracking-tight text-[rgba(45,34,20,0.96)]">
-                {t('generation.sessionNotFound')}
+                未找到本次生成记录
               </h2>
               <p className="mx-auto max-w-sm text-sm leading-7 text-[rgba(97,78,53,0.8)]">
-                {t('generation.sessionNotFoundDesc')}
+                可能已过期或被清理，请返回首页重新开始。
               </p>
             </div>
             <Button
@@ -862,7 +862,7 @@ export function GenerationPreviewContent() {
               className="h-12 w-full rounded-2xl bg-[rgba(63,48,28,0.96)] text-white hover:bg-[rgba(50,37,22,0.96)]"
             >
               <ArrowLeft className="size-4 mr-2" />
-              {t('generation.backToHome')}
+              回到学习首页
             </Button>
           </div>
         </Card>
@@ -923,7 +923,7 @@ export function GenerationPreviewContent() {
             {/* Central Content */}
             <div className="mt-6 flex w-full flex-1 flex-col items-center justify-center space-y-8">
               <div className="rounded-full border border-[rgba(151,118,75,0.14)] bg-white/74 px-4 py-1.5 text-[11px] uppercase tracking-[0.28em] text-[rgba(118,91,55,0.76)]">
-                课堂生成进行中 · {Math.min(currentStepIndex + 1, activeSteps.length)}/
+                学习内容准备中 · {Math.min(currentStepIndex + 1, activeSteps.length)}/
                 {activeSteps.length}
               </div>
 
@@ -1082,7 +1082,7 @@ export function GenerationPreviewContent() {
                 className="flex items-center gap-3 text-sm font-medium uppercase tracking-[0.24em] text-[rgba(106,84,57,0.58)]"
               >
                 <Sparkles className="size-3 animate-pulse" />
-                {t('generation.aiWorking')}
+                AI 正在处理中
                 {generatedAgents.length > 0 && !showAgentReveal && (
                   <button
                     onClick={() => setShowAgentReveal(true)}

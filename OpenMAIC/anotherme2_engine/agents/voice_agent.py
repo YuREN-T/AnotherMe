@@ -4,6 +4,7 @@ Voice agent: generate per-step narration audio with Edge TTS.
 
 import asyncio
 import subprocess
+import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,10 @@ import edge_tts
 
 from .base_agent import BaseAgent
 from .vision_tool import VisionTool
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
 
 
 class VoiceAgent(BaseAgent):
@@ -34,6 +39,26 @@ class VoiceAgent(BaseAgent):
         self.voice_name = config.get("voice", "zh-CN-XiaoxiaoNeural")
         self.rate = config.get("rate", "+0%")
         self.volume = config.get("volume", "+10%")
+        self.optimize_narration_with_llm = bool(config.get("optimize_narration_with_llm", True))
+        raw_tts_concurrency = config.get("tts_concurrency", 3)
+        try:
+            parsed_tts_concurrency = int(raw_tts_concurrency)
+        except (TypeError, ValueError):
+            parsed_tts_concurrency = 3
+            print(f"[VoiceAgent] 无效 tts_concurrency={raw_tts_concurrency!r}，已回退为 3")
+        self.tts_concurrency = max(1, parsed_tts_concurrency)
+        raw_llm_concurrency = config.get("narration_optimization_concurrency", self.tts_concurrency)
+        try:
+            parsed_llm_concurrency = int(raw_llm_concurrency)
+        except (TypeError, ValueError):
+            parsed_llm_concurrency = self.tts_concurrency
+        self.narration_optimization_concurrency = max(1, parsed_llm_concurrency)
+        raw_fallback_ratio = config.get("max_silent_fallback_ratio", 1.0)
+        try:
+            parsed_fallback_ratio = float(raw_fallback_ratio)
+        except (TypeError, ValueError):
+            parsed_fallback_ratio = 1.0
+        self.max_silent_fallback_ratio = max(0.0, min(parsed_fallback_ratio, 1.0))
 
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         project = state["project"]
@@ -51,71 +76,194 @@ class VoiceAgent(BaseAgent):
             return state
 
         print("\n[VoiceAgent] 开始生成音频...")
-        optimized_narrations = self._optimize_narrations(script_steps)
+        voice_style = self._resolve_voice_style(state)
+        active_rate = str(voice_style.get("rate", self.rate) or self.rate)
+        active_volume = str(voice_style.get("volume", self.volume) or self.volume)
 
-        output_dir = Path(self.config.get("output_dir", "./output")) / "audio"
+        if self.optimize_narration_with_llm and self.llm is not None:
+            optimized_narrations = asyncio.run(self._optimize_narrations_async(script_steps, voice_style=voice_style))
+        else:
+            optimized_narrations = [str(getattr(step, "narration", "") or "").strip() for step in script_steps]
+
+        output_dir = Path(self.config.get("output_dir", str(DEFAULT_OUTPUT_DIR))) / "audio"
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        audio_paths = [output_dir / f"narration_{i + 1:03d}.mp3" for i in range(len(optimized_narrations))]
+        tts_success_flags = asyncio.run(
+            self._generate_tts_batch(
+                optimized_narrations,
+                audio_paths,
+                rate=active_rate,
+                volume=active_volume,
+            )
+        )
+
         tts_files: List[str] = []
-        for i, narration in enumerate(optimized_narrations):
-            audio_path = output_dir / f"narration_{i + 1:03d}.mp3"
-            print(f"[VoiceAgent] 生成第 {i + 1} 段音频...")
-            success = asyncio.run(self._generate_tts(narration, str(audio_path)))
+        fallback_audio_count = 0
+        for i, audio_path in enumerate(audio_paths):
+            success = bool(tts_success_flags[i]) if i < len(tts_success_flags) else False
 
             if success:
                 duration = self._get_audio_duration(str(audio_path))
                 if duration is None or duration <= 0:
                     print(f"[VoiceAgent] ✗ 音频 {i + 1} 文件无效，已跳过")
                     self._delete_if_exists(audio_path)
-                    script_steps[i].audio_file = None
-                    script_steps[i].audio_duration = None
+                    success = False
+                else:
+                    tts_files.append(str(audio_path))
+                    script_steps[i].audio_file = str(audio_path)
+                    script_steps[i].audio_duration = duration
+                    print(f"[VoiceAgent] ✓ 音频 {i + 1} 生成成功")
                     continue
 
-                tts_files.append(str(audio_path))
-                script_steps[i].audio_file = str(audio_path)
-                script_steps[i].audio_duration = duration
-                print(f"[VoiceAgent] ✓ 音频 {i + 1} 生成成功")
+            fallback_audio = audio_path.with_suffix(".wav")
+            fallback_duration = self._resolve_step_duration(script_steps[i])
+            fallback_ok = self._create_silent_wav(fallback_audio, fallback_duration)
+            if fallback_ok and self._is_valid_audio_file(fallback_audio):
+                actual_duration = self._get_audio_duration(str(fallback_audio)) or fallback_duration
+                script_steps[i].audio_file = str(fallback_audio)
+                script_steps[i].audio_duration = actual_duration
+                tts_files.append(str(fallback_audio))
+                fallback_audio_count += 1
+                print(f"[VoiceAgent] ! 音频 {i + 1} 使用静音兜底：{fallback_audio}")
             else:
                 script_steps[i].audio_file = None
                 script_steps[i].audio_duration = None
                 print(f"[VoiceAgent] ✗ 音频 {i + 1} 生成失败")
 
         merged_audio = None
-        if tts_files:
+        if tts_files and all(Path(audio).suffix.lower() == ".mp3" for audio in tts_files):
             merged_audio = self._merge_audio_files(tts_files, output_dir / "merged_narration.mp3")
             project.audio_merged_file = merged_audio
             if merged_audio:
                 print(f"[VoiceAgent] 音频合并完成：{merged_audio}")
+        else:
+            project.audio_merged_file = None
+
+        fallback_ratio = (fallback_audio_count / max(len(script_steps), 1)) if script_steps else 0.0
+        metadata = state.setdefault("metadata", {})
+        metadata["voice_fallback_ratio"] = round(fallback_ratio, 4)
 
         project.tts_audio_files = tts_files
+        if fallback_ratio >= self.max_silent_fallback_ratio and fallback_audio_count > 0:
+            project.status = "failed"
+            project.error_message = (
+                "TTS unavailable for all narration segments; "
+                f"silent fallback ratio={fallback_ratio:.2f}"
+            )
+            state["project"] = project
+            state["current_step"] = "voice_failed"
+            state["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "讲解音频生成失败："
+                        f"静音兜底比例 {fallback_ratio:.2f} 超过阈值 {self.max_silent_fallback_ratio:.2f}。"
+                    ),
+                }
+            )
+            return state
+
         state["project"] = project
         state["current_step"] = "voice_completed"
         state["messages"].append(
             {
                 "role": "assistant",
-                "content": f"讲解音频生成完成，共 {len(tts_files)} 段。",
+                "content": (
+                    f"讲解音频生成完成，共 {len(tts_files)} 段。"
+                    f"静音兜底 {fallback_audio_count} 段。"
+                    f"静音占比 {fallback_ratio:.2f}。"
+                    f"语速={active_rate}。"
+                ),
             }
         )
         return state
 
-    def _optimize_narrations(self, steps: List[Any]) -> List[str]:
+    def _optimize_narrations(self, steps: List[Any], voice_style: Optional[Dict[str, Any]] = None) -> List[str]:
         print("[VoiceAgent] 优化旁白文案...")
         narrations: List[str] = []
         for step in steps:
-            user_prompt = (
-                "请把下面这段几何讲解润色成适合中文 TTS 播放的旁白。\n"
-                "要求：自然、清晰、不要改变数学含义、不要输出解释。\n\n"
-                f"{getattr(step, 'narration', '')}"
+            user_prompt = self._build_narration_prompt(
+                narration=str(getattr(step, "narration", "") or ""),
+                voice_style=voice_style,
             )
             messages = self._format_messages(
                 system_prompt=self.system_prompt,
                 user_prompt=user_prompt,
             )
-            response_content = self._invoke_llm(messages)
-            narrations.append((response_content or "").strip() or str(getattr(step, "narration", "") or "").strip())
+            fallback_text = str(getattr(step, "narration", "") or "").strip()
+            try:
+                response_content = self._invoke_llm(messages)
+                narrations.append((response_content or "").strip() or fallback_text)
+            except Exception as exc:
+                print(f"[VoiceAgent] 旁白优化失败，使用原文：{exc}")
+                narrations.append(fallback_text)
         return narrations
 
-    async def _generate_tts(self, text: str, output_path: str) -> bool:
+    async def _optimize_narrations_async(
+        self,
+        steps: List[Any],
+        voice_style: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        print("[VoiceAgent] 并发优化旁白文案...")
+        semaphore = asyncio.Semaphore(self.narration_optimization_concurrency)
+        narrations: List[str] = [""] * len(steps)
+
+        async def _run_one(index: int, step: Any) -> None:
+            fallback_text = str(getattr(step, "narration", "") or "").strip()
+            user_prompt = self._build_narration_prompt(
+                narration=fallback_text,
+                voice_style=voice_style,
+            )
+            messages = self._format_messages(
+                system_prompt=self.system_prompt,
+                user_prompt=user_prompt,
+            )
+            try:
+                async with semaphore:
+                    response_content = await asyncio.to_thread(self._invoke_llm, messages)
+                narrations[index] = (response_content or "").strip() or fallback_text
+            except Exception as exc:
+                print(f"[VoiceAgent] 第 {index + 1} 段旁白优化失败，回退原文：{exc}")
+                narrations[index] = fallback_text
+
+        await asyncio.gather(*[_run_one(i, step) for i, step in enumerate(steps)])
+        return narrations
+
+    async def _generate_tts_batch(
+        self,
+        texts: List[str],
+        audio_paths: List[Path],
+        *,
+        rate: str,
+        volume: str,
+    ) -> List[bool]:
+        semaphore = asyncio.Semaphore(self.tts_concurrency)
+        results: List[bool] = [False] * len(texts)
+
+        async def _run_one(index: int, text: str, audio_path: Path) -> None:
+            print(f"[VoiceAgent] 生成第 {index + 1} 段音频...")
+            async with semaphore:
+                results[index] = await self._generate_tts(
+                    text,
+                    str(audio_path),
+                    rate=rate,
+                    volume=volume,
+                )
+
+        await asyncio.gather(
+            *[_run_one(i, text, audio_paths[i]) for i, text in enumerate(texts)]
+        )
+        return results
+
+    async def _generate_tts(
+        self,
+        text: str,
+        output_path: str,
+        *,
+        rate: Optional[str] = None,
+        volume: Optional[str] = None,
+    ) -> bool:
         max_retries = 3
         output = Path(output_path)
         for attempt in range(max_retries):
@@ -123,8 +271,8 @@ class VoiceAgent(BaseAgent):
                 communicate = edge_tts.Communicate(
                     text=text,
                     voice=self.voice_name,
-                    rate=self.rate,
-                    volume=self.volume,
+                    rate=str(rate or self.rate),
+                    volume=str(volume or self.volume),
                 )
                 await communicate.save(str(output))
                 if not self._is_valid_audio_file(output):
@@ -145,9 +293,19 @@ class VoiceAgent(BaseAgent):
             path = Path(audio_path)
             if not self._is_valid_audio_file(path):
                 return None
-            from mutagen.mp3 import MP3
+            if path.suffix.lower() == ".wav":
+                with wave.open(str(path), "rb") as wav_file:
+                    frame_rate = wav_file.getframerate()
+                    frame_count = wav_file.getnframes()
+                    if frame_rate <= 0:
+                        return None
+                    return float(frame_count) / float(frame_rate)
 
-            audio = MP3(str(path))
+            from mutagen import File as MutagenFile
+
+            audio = MutagenFile(str(path))
+            if audio is None or getattr(audio, "info", None) is None:
+                return None
             length = getattr(audio.info, "length", None)
             return float(length) if length else None
         except Exception as exc:
@@ -159,11 +317,48 @@ class VoiceAgent(BaseAgent):
             path = Path(audio_path)
             if not path.exists() or path.stat().st_size <= 0:
                 return False
-            from mutagen.mp3 import MP3
+            if path.suffix.lower() == ".wav":
+                with wave.open(str(path), "rb") as wav_file:
+                    frame_rate = wav_file.getframerate()
+                    frame_count = wav_file.getnframes()
+                    return bool(frame_rate > 0 and frame_count > 0)
 
-            audio = MP3(str(path))
+            from mutagen import File as MutagenFile
+
+            audio = MutagenFile(str(path))
+            if audio is None or getattr(audio, "info", None) is None:
+                return False
             return bool(getattr(audio.info, "length", 0) and audio.info.length > 0)
         except Exception:
+            return False
+
+    def _resolve_step_duration(self, step: Any) -> float:
+        raw_duration = (
+            getattr(step, "audio_duration", None)
+            or getattr(step, "duration", None)
+            or 0
+        )
+        try:
+            parsed = float(raw_duration)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        return parsed if parsed > 0 else 1.0
+
+    def _create_silent_wav(self, output_path: Path, duration: float) -> bool:
+        try:
+            safe_duration = max(0.5, float(duration))
+            sample_rate = 16000
+            total_frames = int(sample_rate * safe_duration)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(b"\x00\x00" * total_frames)
+            return True
+        except Exception as exc:
+            print(f"创建静音兜底音频失败：{exc}")
+            self._delete_if_exists(output_path)
             return False
 
     def _merge_audio_files(self, audio_files: List[str], output_path: Path) -> Optional[str]:
@@ -215,3 +410,42 @@ class VoiceAgent(BaseAgent):
             path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    def _resolve_voice_style(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        raw_metadata = state.get("metadata")
+        metadata: Dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+
+        raw_adaptive_plan = metadata.get("adaptive_plan")
+        adaptive_plan: Dict[str, Any] = raw_adaptive_plan if isinstance(raw_adaptive_plan, dict) else {}
+
+        raw_tts_profile = adaptive_plan.get("tts_profile")
+        tts_profile: Dict[str, Any] = raw_tts_profile if isinstance(raw_tts_profile, dict) else {}
+
+        return {
+            "rate": str(tts_profile.get("rate", self.rate) or self.rate),
+            "volume": str(tts_profile.get("volume", self.volume) or self.volume),
+            "pause_style": str(tts_profile.get("pause_style", "normal") or "normal"),
+            "mode": str(adaptive_plan.get("mode", "standard") or "standard"),
+        }
+
+    def _build_narration_prompt(self, narration: str, voice_style: Optional[Dict[str, Any]] = None) -> str:
+        style = voice_style or {}
+        mode = str(style.get("mode", "standard") or "standard")
+        pause_style = str(style.get("pause_style", "normal") or "normal")
+
+        extra_rules = ""
+        if mode == "remedial":
+            extra_rules = (
+                "补充要求：句子更短，关键结论用两句话表达；"
+                "在'所以/因此/结论是'前后增加自然停顿感。"
+            )
+        elif mode == "advanced":
+            extra_rules = "补充要求：节奏紧凑，减少重复表述，但保持逻辑完整。"
+
+        return (
+            "请把下面这段几何讲解润色成适合中文 TTS 播放的旁白。\n"
+            "要求：自然、清晰、不要改变数学含义、不要输出解释。\n"
+            f"当前语音风格：mode={mode}, pause_style={pause_style}。\n"
+            f"{extra_rules}\n\n"
+            f"{narration}"
+        )

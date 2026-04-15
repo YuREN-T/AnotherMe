@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import shutil
 from dataclasses import dataclass
@@ -9,6 +10,9 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from .config import Settings, get_settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class ObjectStorage(Protocol):
@@ -149,6 +153,26 @@ def guess_content_type(filename: str) -> str:
 
 def build_storage(settings: Settings | None = None) -> ObjectStorage:
     cfg = settings or get_settings()
+
+    def _local_storage() -> LocalObjectStorage:
+        # If MinIO/S3 settings are reused, avoid emitting dead MinIO public URLs after fallback.
+        public_base_url = cfg.object_storage_public_base_url.strip()
+        endpoint = cfg.object_storage_endpoint.strip()
+        if endpoint and public_base_url.rstrip("/") == endpoint.rstrip("/"):
+            public_base_url = ""
+        return LocalObjectStorage(Path(cfg.local_storage_root), public_base_url)
+
     if cfg.object_storage_driver.lower() in {"s3", "minio"}:
-        return S3ObjectStorage(cfg)
-    return LocalObjectStorage(Path(cfg.local_storage_root), cfg.object_storage_public_base_url)
+        try:
+            return S3ObjectStorage(cfg)
+        except Exception as exc:
+            if cfg.app_env.lower() not in {"dev", "development", "local", "test"}:
+                raise
+            logger.warning(
+                "Object storage driver '%s' is unavailable (%s); falling back to local storage at %s.",
+                cfg.object_storage_driver,
+                exc,
+                cfg.local_storage_root,
+            )
+            return _local_storage()
+    return _local_storage()

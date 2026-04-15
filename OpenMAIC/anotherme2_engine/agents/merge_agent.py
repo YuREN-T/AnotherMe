@@ -1,6 +1,8 @@
 """
 合成智能体 - 负责渲染动画并合并音视频
 """
+import json
+import hashlib
 import os
 import re
 import shutil
@@ -9,8 +11,14 @@ from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
 from .base_agent import BaseAgent
+from .error_classifier import classify_render_error
+from .formal_video_validator import FormalVideoValidator
 from .repair_agent import RepairAgent
 from .state import VideoProject
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
 
 
 class MergeAgent(BaseAgent):
@@ -18,13 +26,13 @@ class MergeAgent(BaseAgent):
 
     def __init__(self, config: Dict[str, Any], llm: Optional[Any] = None):
         super().__init__(config, llm)
-        self.output_dir = Path(config.get("output_dir", "./output"))
+        self.output_dir = Path(config.get("output_dir", str(DEFAULT_OUTPUT_DIR)))
         self.resolution = config.get("resolution", "1920x1080")
         self.fps = config.get("fps", 60)
         # 默认低画质以提升稳定性与调试速度（可通过配置覆盖为 -qm/-qh）
         self.manim_quality = config.get("manim_quality", "-ql")
         self.render_timeout = int(config.get("render_timeout", 900))
-        self.max_repair_rounds = int(config.get("max_repair_rounds", 3))
+        self.max_repair_rounds = int(config.get("max_repair_rounds", 2))
         self.canvas_config = config.get("canvas_config", {
             "frame_height": 8.0,
             "frame_width": 14.222,
@@ -34,6 +42,7 @@ class MergeAgent(BaseAgent):
         })
         self.layout = config.get("layout", "left_graph_right_formula")
         self._last_render_error = ""
+        self.validator = FormalVideoValidator(self.canvas_config)
         self.repair_agent = RepairAgent(
             config={
                 "use_llm_repair": False,
@@ -64,10 +73,13 @@ class MergeAgent(BaseAgent):
         if getattr(project, "status", "") == "failed":
             return state
 
+        metadata = state.setdefault("metadata", {})
+        expected_steps = self._build_expected_steps(project)
+
         # 1. 保存 Manim 代码到文件
         print("\n[MergeAgent] 开始合成视频...")
 
-        manim_code = state.get("metadata", {}).get("manim_code", "")
+        manim_code = metadata.get("manim_code", "")
         if not manim_code:
             state["messages"].append({
                 "role": "assistant",
@@ -80,13 +92,49 @@ class MergeAgent(BaseAgent):
         # 保存代码
         self.output_dir.mkdir(parents=True, exist_ok=True)
         manim_file = self.output_dir / "math_animation.py"
-        with open(manim_file, 'w', encoding='utf-8') as f:
-            f.write(manim_code)
         project.manim_file_path = str(manim_file)
+        working_code = manim_code
+
+        preflight_ok, preflight_error, preflight_report = self._preflight_code(
+            working_code,
+            expected_steps=expected_steps,
+        )
+        metadata["formal_validation"] = preflight_report
+        if not preflight_ok:
+            error_code = classify_render_error(preflight_error)
+            metadata["render_error_code"] = error_code
+            self._write_debug_json(
+                "error_classification.json",
+                {
+                    "stage": "preflight",
+                    "render_error_code": error_code,
+                    "message": preflight_error,
+                },
+            )
+            if self._try_switch_to_conservative_candidate(state, reason=preflight_error):
+                working_code = state["metadata"]["manim_code"]
+                preflight_ok, preflight_error, preflight_report = self._preflight_code(
+                    working_code,
+                    expected_steps=expected_steps,
+                )
+                metadata["formal_validation"] = preflight_report
+                if preflight_ok:
+                    metadata["render_error_code"] = None
+                    self._write_debug_json(
+                        "error_classification.json",
+                        {
+                            "stage": "preflight",
+                            "render_error_code": None,
+                            "message": "",
+                        },
+                    )
+
+        with open(manim_file, 'w', encoding='utf-8') as f:
+            f.write(working_code)
         print(f"[MergeAgent] Manim 代码已保存：{manim_file}")
 
         # 1.5 渲染前做越界/布局风险检查
-        risk_warnings = self._check_layout_risks(manim_code)
+        risk_warnings = self._check_layout_risks(working_code)
         if risk_warnings:
             print("[MergeAgent] 布局风险检查发现潜在问题：")
             for w in risk_warnings:
@@ -102,45 +150,100 @@ class MergeAgent(BaseAgent):
             video_file.unlink()
         class_name = project.manim_class_name or "MathAnimation"
         print(f"[MergeAgent] 开始渲染 Manim 动画（类名: {class_name}）...")
-        working_code = manim_code
         render_success = False
         render_error = ""
-        for round_idx in range(self.max_repair_rounds + 1):
-            render_success, render_error = self._render_manim(
-                manim_file=str(manim_file),
-                output_file=str(video_file),
-                class_name=class_name
-            )
-            if render_success:
-                if round_idx > 0:
-                    print(f"[MergeAgent] 经过 {round_idx} 轮修复后渲染成功")
-                    state["messages"].append({
-                        "role": "assistant",
-                        "content": f"Manim 经过 {round_idx} 轮自动修复后渲染成功"
-                    })
-                break
+        repair_rounds = 0
+        attempted_conservative = str(metadata.get("manim_codegen_mode", "")) == "template_conservative"
+        error_code = ""
 
-            # 最后一轮失败后直接退出
-            if round_idx >= self.max_repair_rounds:
-                break
-
-            fixed_code, fixes = self.repair_agent.repair_with_error(working_code, render_error)
-            if fixed_code == working_code:
-                # 无可修复变化，避免死循环
-                break
-
-            print(f"[MergeAgent] 第 {round_idx + 1} 轮自动修复完成，开始重试渲染...")
-            state["messages"].append({
-                "role": "assistant",
-                "content": (
-                    f"触发第 {round_idx + 1} 轮自动修复并重试渲染；"
-                    f"修复项：{'；'.join(fixes) if fixes else '基于报错未匹配到规则'}"
+        if preflight_ok:
+            while True:
+                render_success, render_error = self._render_manim(
+                    manim_file=str(manim_file),
+                    output_file=str(video_file),
+                    class_name=class_name
                 )
-            })
-            working_code = fixed_code
-            with open(manim_file, 'w', encoding='utf-8') as f:
-                f.write(working_code)
-            state.setdefault("metadata", {})["manim_code"] = working_code
+                if render_success:
+                    if repair_rounds > 0:
+                        print(f"[MergeAgent] 经过 {repair_rounds} 轮定向修复后渲染成功")
+                        state["messages"].append({
+                            "role": "assistant",
+                            "content": f"Manim 经过 {repair_rounds} 轮定向修复后渲染成功"
+                        })
+                    break
+
+                error_code = classify_render_error(render_error)
+                metadata["render_error_code"] = error_code
+                self._write_debug_json(
+                    "error_classification.json",
+                    {
+                        "stage": "render",
+                        "render_error_code": error_code,
+                        "message": render_error,
+                    },
+                )
+
+                if (
+                    not attempted_conservative
+                    and error_code in {"PY_SYNTAX", "INVALID_TIMING", "LAYOUT_OVERFLOW", "LATEX_TEXT_INVALID"}
+                    and self._try_switch_to_conservative_candidate(state, reason=render_error)
+                ):
+                    attempted_conservative = True
+                    working_code = state["metadata"]["manim_code"]
+                    with open(manim_file, 'w', encoding='utf-8') as f:
+                        f.write(working_code)
+                    preflight_ok, preflight_error, preflight_report = self._preflight_code(
+                        working_code,
+                        expected_steps=expected_steps,
+                    )
+                    metadata["formal_validation"] = preflight_report
+                    if not preflight_ok:
+                        render_error = preflight_error
+                        metadata["render_error_code"] = classify_render_error(preflight_error)
+                        break
+                    continue
+
+                if error_code not in {"MANIM_API", "UNKNOWN"}:
+                    break
+
+                if repair_rounds >= self.max_repair_rounds:
+                    break
+
+                fixed_code, fixes = self.repair_agent.repair_with_error(
+                    working_code,
+                    render_error,
+                    template_references=metadata.get("template_references", []),
+                )
+                if fixed_code == working_code:
+                    break
+
+                repair_rounds += 1
+                print(f"[MergeAgent] 第 {repair_rounds} 轮定向修复完成，开始重试渲染...")
+                state["messages"].append({
+                    "role": "assistant",
+                    "content": (
+                        f"触发第 {repair_rounds} 轮定向修复并重试渲染；"
+                        f"修复项：{'；'.join(fixes) if fixes else '基于报错未匹配到规则'}"
+                    )
+                })
+                working_code = fixed_code
+                metadata["manim_code"] = working_code
+                with open(manim_file, 'w', encoding='utf-8') as f:
+                    f.write(working_code)
+
+                preflight_ok, preflight_error, preflight_report = self._preflight_code(
+                    working_code,
+                    expected_steps=expected_steps,
+                )
+                metadata["formal_validation"] = preflight_report
+                if not preflight_ok:
+                    render_error = preflight_error
+                    metadata["render_error_code"] = classify_render_error(preflight_error)
+                    break
+        else:
+            render_error = preflight_error
+            error_code = classify_render_error(preflight_error)
+            metadata["render_error_code"] = error_code
 
         if not render_success:
             state["messages"].append({
@@ -214,6 +317,87 @@ class MergeAgent(BaseAgent):
 
         return state
 
+    def _write_debug_json(self, filename: str, payload: Any) -> None:
+        debug_dir = self.output_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _build_expected_steps(self, project: VideoProject) -> List[Dict[str, Any]]:
+        expected: List[Dict[str, Any]] = []
+        for step in getattr(project, "script_steps", []) or []:
+            duration = float(getattr(step, "audio_duration", 0.0) or getattr(step, "duration", 0.0) or 0.0)
+            expected.append(
+                {
+                    "step_id": int(getattr(step, "id", 0) or 0),
+                    "duration": round(duration, 2),
+                }
+            )
+        return expected
+
+    def _preflight_code(
+        self,
+        manim_code: str,
+        *,
+        expected_steps: List[Dict[str, Any]],
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        try:
+            compile(manim_code, "math_animation.py", "exec")
+        except SyntaxError as exc:
+            report = {
+                "is_valid": False,
+                "failed_checks": [{"check": "compile", "message": f"python compile failed: {exc}"}],
+                "checks": [],
+                "timing": [],
+            }
+            return False, f"python compile failed: {exc}", report
+
+        is_valid, error_message, report = self.validator.validate(
+            manim_code,
+            expected_steps=expected_steps,
+        )
+        return is_valid, error_message, report
+
+    def _try_switch_to_conservative_candidate(
+        self,
+        state: Dict[str, Any],
+        *,
+        reason: str,
+    ) -> bool:
+        metadata = state.setdefault("metadata", {})
+        candidates = metadata.get("manim_code_candidates", {})
+        conservative_code = candidates.get("template_conservative")
+        if not conservative_code:
+            return False
+        if conservative_code == metadata.get("manim_code"):
+            return False
+
+        report = (
+            metadata.get("validation_candidates", {}).get("template_conservative")
+            if isinstance(metadata.get("validation_candidates"), dict)
+            else None
+        )
+        if isinstance(report, dict) and report.get("is_valid") is False:
+            return False
+
+        metadata["manim_code"] = conservative_code
+        metadata["manim_codegen_mode"] = "template_conservative"
+        metadata["fallback_level"] = "conservative"
+        metadata["render_error_code"] = None
+        self._write_debug_text("final_codegen_mode.txt", "template_conservative")
+        state["messages"].append({
+            "role": "assistant",
+            "content": f"检测到正式模板风险，已切换到保守模板继续渲染。原因：{reason[:120]}",
+        })
+        return True
+
+    def _write_debug_text(self, filename: str, content: str) -> None:
+        debug_dir = self.output_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / filename).write_text(str(content), encoding="utf-8")
+
     def _check_layout_risks(self, manim_code: str) -> List[str]:
         """渲染前进行静态布局风险扫描，提前提示越界和左右分栏冲突。"""
         warnings: List[str] = []
@@ -251,6 +435,65 @@ class MergeAgent(BaseAgent):
 
         return warnings
 
+    @staticmethod
+    def _is_partial_manim_artifact(path: Path) -> bool:
+        return any(part == "partial_movie_files" for part in path.parts)
+
+    @staticmethod
+    def _fingerprint_file(path: Path) -> str:
+        hasher = hashlib.sha1()
+        with path.open("rb") as fp:
+            hasher.update(fp.read(65536))
+        return hasher.hexdigest()
+
+    def _collect_non_partial_mp4_state(self, media_dir: Path) -> Dict[str, Tuple[float, int, str]]:
+        if not media_dir.exists():
+            return {}
+        return {
+            str(path.resolve()): (path.stat().st_mtime, path.stat().st_size, self._fingerprint_file(path))
+            for path in media_dir.rglob("*.mp4")
+            if not self._is_partial_manim_artifact(path)
+        }
+
+    def _select_rendered_mp4(
+        self,
+        media_dir: Path,
+        pre_existing_state: Dict[str, Tuple[float, int, str]],
+        class_name: str,
+    ) -> Optional[Path]:
+        candidates = [
+            path
+            for path in media_dir.rglob("*.mp4")
+            if not self._is_partial_manim_artifact(path)
+        ]
+        if not candidates:
+            return None
+
+        class_candidates = [path for path in candidates if path.stem == class_name]
+        scoped_candidates = class_candidates or candidates
+
+        new_candidates = []
+        for path in scoped_candidates:
+            resolved = str(path.resolve())
+            previous_state = pre_existing_state.get(resolved)
+            current_mtime = path.stat().st_mtime
+            current_size = path.stat().st_size
+            if previous_state is None:
+                new_candidates.append(path)
+                continue
+            previous_mtime, previous_size, previous_fingerprint = previous_state
+            if current_mtime > (previous_mtime + 1e-6) or current_size != previous_size:
+                new_candidates.append(path)
+                continue
+
+            if self._fingerprint_file(path) != previous_fingerprint:
+                new_candidates.append(path)
+
+        if new_candidates:
+            return max(new_candidates, key=lambda p: p.stat().st_mtime)
+
+        return None
+
     def _render_manim(self, manim_file: str, output_file: str,
                       class_name: str = "MathAnimation") -> Tuple[bool, str]:
         """
@@ -266,6 +509,7 @@ class MergeAgent(BaseAgent):
         """
         try:
             media_dir = self.output_dir / "media"
+            pre_existing_mp4s = self._collect_non_partial_mp4_state(media_dir)
             # 用 --media_dir 控制输出目录，避免路径修得问题
             cmd = [
                 "manim", self.manim_quality,
@@ -285,10 +529,9 @@ class MergeAgent(BaseAgent):
             )
 
             if result.returncode == 0:
-                # 在 media_dir 下搜索刚生成的 mp4，复制到 output_file
-                mp4_files = list(media_dir.rglob("*.mp4"))
-                if mp4_files:
-                    latest = max(mp4_files, key=lambda p: p.stat().st_mtime)
+                # 仅选取非 partial_movie_files 的正式产物，避免误拷贝中间分片或历史文件。
+                latest = self._select_rendered_mp4(media_dir, pre_existing_mp4s, class_name)
+                if latest:
                     shutil.copy2(str(latest), output_file)
                     print(f"Manim 渲染成功：{output_file}")
                     return True, ""

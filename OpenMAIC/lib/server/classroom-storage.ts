@@ -41,6 +41,15 @@ export interface PersistedClassroomData {
   createdAt: string;
 }
 
+export interface ClassroomSummary {
+  id: string;
+  title: string;
+  language?: string;
+  createdAt: string;
+  scenesCount: number;
+  sceneTypes: Array<Scene['type']>;
+}
+
 export function isValidClassroomId(id: string): boolean {
   return /^[a-zA-Z0-9_-]+$/.test(id);
 }
@@ -56,6 +65,59 @@ export async function readClassroom(id: string): Promise<PersistedClassroomData 
     }
     throw error;
   }
+}
+
+export async function listClassroomSummaries(limit = 50): Promise<ClassroomSummary[]> {
+  await ensureClassroomsDir();
+
+  const files = await fs.readdir(CLASSROOMS_DIR);
+  const jsonFiles = files.filter((name) => name.endsWith('.json'));
+
+  const safeLimit = Math.max(1, Math.min(limit, 100));
+  // Use file mtime as a cheap pre-sort to avoid parsing every classroom file.
+  const candidates = await Promise.all(
+    jsonFiles.map(async (fileName) => {
+      const filePath = path.join(CLASSROOMS_DIR, fileName);
+      const stat = await fs.stat(filePath);
+      return { fileName, filePath, mtimeMs: stat.mtimeMs };
+    }),
+  );
+
+  const selectedFiles = candidates
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, safeLimit * 3);
+
+  const summaries: ClassroomSummary[] = [];
+
+  for (const file of selectedFiles) {
+    try {
+      const content = await fs.readFile(file.filePath, 'utf-8');
+      const item = JSON.parse(content) as Partial<PersistedClassroomData>;
+
+      if (!item.id || !item.createdAt) continue;
+
+      const scenes = Array.isArray(item.scenes) ? item.scenes : [];
+      const stageName = item.stage && typeof item.stage === 'object' ? item.stage.name : undefined;
+      const stageLanguage =
+        item.stage && typeof item.stage === 'object' ? item.stage.language : undefined;
+
+      summaries.push({
+        id: item.id,
+        title: stageName || item.id,
+        language: stageLanguage,
+        createdAt: item.createdAt,
+        scenesCount: scenes.length,
+        sceneTypes: Array.from(new Set(scenes.map((scene) => scene.type))),
+      });
+    } catch {
+      // Skip unreadable/corrupted files to keep the list endpoint resilient.
+      continue;
+    }
+  }
+
+  return summaries
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .slice(0, safeLimit);
 }
 
 export async function persistClassroom(

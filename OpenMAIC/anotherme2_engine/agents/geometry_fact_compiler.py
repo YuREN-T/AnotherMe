@@ -52,6 +52,7 @@ class GeometryFactCompiler:
 
         point_order: List[str] = []
         point_set: set[str] = set()
+        point_payloads: Dict[str, Dict[str, Any]] = {}
         primitives: List[Dict[str, Any]] = []
         constraints: List[Dict[str, Any]] = []
         measurements: List[Dict[str, Any]] = []
@@ -63,6 +64,10 @@ class GeometryFactCompiler:
             if point_id not in point_set:
                 point_set.add(point_id)
                 point_order.append(point_id)
+            payload = point_payloads.setdefault(point_id, {"id": point_id})
+            raw_label = str(raw or "").strip()
+            if raw_label and raw_label != point_id and not payload.get("label"):
+                payload["label"] = raw_label
             return point_id
 
         for point in self._iter_points(facts.get("points")):
@@ -72,6 +77,7 @@ class GeometryFactCompiler:
 
         segment_points: Dict[str, Tuple[str, str]] = {}
         circle_ids_by_center: Dict[str, str] = {}
+        named_angles = self._collect_named_angles(facts, register_point)
 
         for raw_segment in facts.get("segments") or []:
             compiled = self._compile_segment_primitive(raw_segment, register_point)
@@ -179,13 +185,14 @@ class GeometryFactCompiler:
                 continue
             if primitive_type in self.MEASUREMENT_TYPES:
                 compiled = self._compile_measurement(
-                    raw_primitive,
-                    measurement_type=primitive_type,
-                    register_point=register_point,
-                    segment_points=segment_points,
-                )
-                if compiled is not None:
-                    measurements.append(compiled)
+                raw_primitive,
+                measurement_type=primitive_type,
+                register_point=register_point,
+                segment_points=segment_points,
+                named_angles=named_angles,
+            )
+            if compiled is not None:
+                measurements.append(compiled)
 
         relation_items = list(facts.get("relations") or []) + list(facts.get("constraints") or [])
         for raw_relation in relation_items:
@@ -211,12 +218,20 @@ class GeometryFactCompiler:
                 measurement_type=measurement_type,
                 register_point=register_point,
                 segment_points=segment_points,
+                named_angles=named_angles,
             )
             if compiled is not None:
                 measurements.append(compiled)
 
         self._ensure_polygon_edges(
             primitives=primitives,
+            register_point=register_point,
+            segment_points=segment_points,
+        )
+        self._annotate_fold_point_derivations(
+            facts=facts,
+            problem_text=problem_text,
+            point_payloads=point_payloads,
             register_point=register_point,
             segment_points=segment_points,
         )
@@ -239,6 +254,8 @@ class GeometryFactCompiler:
             templates.append("circle_basic")
         if problem_text and ("折叠" in problem_text or "翻折" in problem_text):
             templates.append("fold")
+        if problem_text and ("菱形" in problem_text or "rhombus" in problem_text.lower()):
+            templates.append("rhombus")
 
         constraints = self._sanitize_constraints(
             constraints=constraints,
@@ -267,7 +284,7 @@ class GeometryFactCompiler:
             "confidence": confidence,
             "ambiguities": ambiguities,
             "roles": roles,
-            "points": point_order,
+            "points": [copy.deepcopy(point_payloads[point_id]) for point_id in point_order],
             "primitives": self._dedupe_objects(primitives),
             "constraints": self._dedupe_objects(constraints),
             "measurements": self._dedupe_objects(measurements),
@@ -467,6 +484,7 @@ class GeometryFactCompiler:
         measurement_type: str,
         register_point,
         segment_points: Dict[str, Tuple[str, str]],
+        named_angles: Optional[Dict[str, List[str]]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
             return None
@@ -486,6 +504,12 @@ class GeometryFactCompiler:
             ]
         elif measurement_type == "angle":
             entities = [register_point(item) for item in self._extract_angle_points(raw)]
+            if len(entities) != 3:
+                for key in ("angle", "name", "label"):
+                    token = self._normalize_named_angle_ref(raw.get(key))
+                    if token and token in (named_angles or {}):
+                        entities = [register_point(item) for item in (named_angles or {}).get(token, [])]
+                        break
         elif measurement_type == "ratio":
             entities = self._extract_relation_entities(
                 raw,
@@ -501,7 +525,32 @@ class GeometryFactCompiler:
         entities = [item for item in entities if item]
         if not entities:
             return None
-        return {"type": measurement_type, "entities": entities, "value": value}
+        payload = {"type": measurement_type, "entities": entities, "value": value}
+        for key in ("description", "name", "label", "implied_by"):
+            extra = raw.get(key) if isinstance(raw, dict) else None
+            if str(extra or "").strip():
+                payload[key] = str(extra).strip()
+        return payload
+
+    def _collect_named_angles(self, facts: Dict[str, Any], register_point) -> Dict[str, List[str]]:
+        mapping: Dict[str, List[str]] = {}
+        for bucket in ("angles", "right_angles"):
+            for raw in facts.get(bucket) or []:
+                refs = [register_point(item) for item in self._extract_angle_points(raw)]
+                refs = [item for item in refs if item]
+                if len(refs) != 3:
+                    continue
+                for key in ("name", "label"):
+                    token = self._normalize_named_angle_ref((raw or {}).get(key))
+                    if token:
+                        mapping[token] = refs
+                if refs[1]:
+                    mapping.setdefault(self._normalize_named_angle_ref(f"∠{refs[1]}"), refs)
+        return mapping
+
+    def _normalize_named_angle_ref(self, raw: Any) -> str:
+        text = self._normalize_prime_markers(raw).strip()
+        return text.replace(" ", "")
 
     def _extract_relation_entities(
         self,
@@ -720,11 +769,15 @@ class GeometryFactCompiler:
                             break
                 if len(refs) == 2:
                     return [refs[0], vertex, refs[1]]
+            for key in ("name", "label", "description", "text"):
+                refs = self._extract_angle_points_from_text(raw.get(key))
+                if len(refs) == 3:
+                    return refs
         return self._extract_point_list(raw)
 
     def _extract_polygon_points(self, raw: Any) -> List[str]:
         if isinstance(raw, str):
-            token = self._strip_polygon_markers(raw)
+            token = self._strip_polygon_markers(self._normalize_prime_markers(raw))
             refs = re.findall(r"[A-Za-z]\d*'*", token)
             if len(refs) >= 3 and "".join(refs) == token:
                 return refs
@@ -796,7 +849,7 @@ class GeometryFactCompiler:
         value = str(raw or "").strip()
         if not value:
             return ""
-        value = value.replace(" ", "")
+        value = self._normalize_prime_markers(value).replace(" ", "")
         if value.startswith("seg_") or value.startswith("circle_") or value.startswith("arc_"):
             return ""
         if re.fullmatch(r"[A-Za-z]", value):
@@ -810,7 +863,7 @@ class GeometryFactCompiler:
         return ""
 
     def _split_segment_token(self, value: str) -> List[str]:
-        token = str(value or "").strip().replace(" ", "")
+        token = self._normalize_prime_markers(str(value or "").strip()).replace(" ", "")
         if not token:
             return []
         if token.startswith("seg_"):
@@ -856,6 +909,78 @@ class GeometryFactCompiler:
             seen.add(signature)
             result.append(item)
         return result
+
+    def _normalize_prime_markers(self, value: Any) -> str:
+        return str(value or "").replace("′", "'").replace("’", "'").replace("`", "'")
+
+    def _extract_angle_points_from_text(self, raw_text: Any) -> List[str]:
+        text = self._normalize_prime_markers(raw_text).strip()
+        if not text:
+            return []
+        patterns = [
+            r"∠\s*([A-Za-z]\d*'*(?:[A-Za-z]\d*'*){2})",
+            r"angle\s*([A-Za-z]\d*'*(?:[A-Za-z]\d*'*){2})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            refs = re.findall(r"[A-Za-z]\d*'*", match.group(1))
+            if len(refs) == 3:
+                return refs
+        return []
+
+    def _annotate_fold_point_derivations(
+        self,
+        *,
+        facts: Dict[str, Any],
+        problem_text: str,
+        point_payloads: Dict[str, Dict[str, Any]],
+        register_point,
+        segment_points: Dict[str, Tuple[str, str]],
+    ) -> None:
+        if "折叠" not in problem_text and "翻折" not in problem_text:
+            return
+        axis = self._infer_fold_axis(problem_text, register_point, segment_points)
+        if axis is None:
+            return
+
+        for payload in point_payloads.values():
+            label = str(payload.get("label") or payload.get("id") or "").strip()
+            normalized = self._normalize_prime_markers(label)
+            if "'" not in normalized:
+                continue
+            base_id = self._normalize_point_id(normalized.replace("'", ""))
+            point_id = str(payload.get("id", "")).strip()
+            if not base_id or point_id == base_id or base_id not in point_payloads:
+                continue
+            payload.setdefault(
+                "derived",
+                {"type": "reflect_point", "source": base_id, "axis": [axis[0], axis[1]]},
+            )
+
+    def _infer_fold_axis(
+        self,
+        problem_text: str,
+        register_point,
+        segment_points: Dict[str, Tuple[str, str]],
+    ) -> Optional[Tuple[str, str]]:
+        normalized = self._normalize_prime_markers(problem_text)
+        match = re.search(r"沿\s*([A-Za-z]\d*'*[A-Za-z]\d*'*)\s*(?:折叠|翻折)", normalized)
+        if match:
+            refs = self._split_segment_token(match.group(1))
+            if len(refs) == 2:
+                axis = (register_point(refs[0]), register_point(refs[1]))
+                if axis[0] and axis[1]:
+                    return axis
+
+        for endpoints in segment_points.values():
+            if len(endpoints) == 2:
+                first, second = endpoints
+                token = f"{first}{second}"
+                if f"沿{token}折叠" in normalized or f"沿{token}翻折" in normalized:
+                    return first, second
+        return None
 
     def _sanitize_constraints(
         self,
@@ -1055,7 +1180,12 @@ class GeometryFactCompiler:
                 continue
             if len(set(entities)) != len(entities):
                 continue
-            sanitized.append({"type": measurement_type, "entities": entities, "value": value})
+            payload = {"type": measurement_type, "entities": entities, "value": value}
+            for key in ("description", "name", "label", "implied_by"):
+                extra = measurement.get(key)
+                if str(extra or "").strip():
+                    payload[key] = str(extra).strip()
+            sanitized.append(payload)
         return sanitized
 
     def _segment_from_primitive(
@@ -1245,10 +1375,6 @@ class GeometryFactCompiler:
         lowered = str(text or "").lower()
         return "正三角形" in lowered or "equilateral" in lowered
 
-    def _mentions_construction(self, text: str) -> bool:
-        lowered = str(text or "").lower()
-        return any(token in lowered for token in ("dashed", "construction", "虚线", "辅助线"))
-
     def _extract_triangle_tokens(self, text: str) -> List[List[str]]:
         tokens: List[List[str]] = []
         normalized = self._strip_polygon_markers(text)
@@ -1274,18 +1400,6 @@ class GeometryFactCompiler:
                 if first and second and first != second:
                     result.append((first, second))
         return result
-
-    def _construction_segment_tokens(self, text: str) -> List[Tuple[str, str]]:
-        content = str(text or "")
-        for match in re.finditer(
-            r"(?:construction|虚线|辅助线)[^()（）]*[\(（]([^()（）]+)[\)）]",
-            content,
-            flags=re.IGNORECASE,
-        ):
-            tokens = self._extract_segment_tokens(match.group(1))
-            if tokens:
-                return tokens
-        return []
 
     def _point_lies_on_same_circle_as_segment(
         self,

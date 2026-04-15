@@ -1,3 +1,6 @@
+"""
+画布场景管理 - 管理几何区和公式区布局，输出稳定布局快照
+"""
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 

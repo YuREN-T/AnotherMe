@@ -40,7 +40,7 @@ class RepairAgent(BaseAgent):
 
         # 可选 LLM 修复（默认关闭，避免不稳定改写）
         if self.llm and self.config.get("use_llm_repair", False):
-            llm_fixed = self._try_llm_repair(fixed_code)
+            llm_fixed = self._try_llm_repair(fixed_code, "", [])
             if llm_fixed:
                 fixed_code = llm_fixed
                 fixes.append("应用了 LLM 二次修复")
@@ -61,64 +61,21 @@ class RepairAgent(BaseAgent):
 
         return state
 
-    def repair_with_error(self, code: str, render_error: str) -> Tuple[str, List[str]]:
+    def repair_with_error(
+        self,
+        code: str,
+        render_error: str,
+        template_references: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, List[str]]:
         """基于渲染报错进行定向修复（用于多轮修复场景）。"""
-        fixed, fixes = self._apply_error_driven_fixes(code, render_error)
+        fixed, fixes = self._apply_error_driven_fixes(
+            code,
+            render_error,
+            template_references=template_references,
+        )
         # 如果错误驱动没有命中，再走通用规则兜底
         if not fixes:
             fixed, fixes = self._apply_rule_based_fixes(code)
-        return fixed, fixes
-
-    def _apply_error_driven_fixes(self, code: str, render_error: str) -> Tuple[str, List[str]]:
-        """根据 manim stderr traceback 做定向修复。"""
-        fixed = code
-        fixes: List[str] = []
-        error_text = render_error or ""
-
-        # A. self.play 参数类型错误（裸 Mobject）
-        if "cannot be converted to an animation" in error_text or "Unexpected argument" in error_text:
-            before = fixed
-            # 仅在独占一行参数时替换，尽量降低误伤
-            pattern = re.compile(
-                r'^(\s*)((?:Polygon|Line|Dot|Circle|Square|Triangle|VGroup)\([^\n]*\)(?:\.[^\n,]+)?)\s*,\s*$',
-                re.MULTILINE,
-            )
-            fixed = pattern.sub(r'\1FadeIn(\2),', fixed)
-            if fixed != before:
-                fixes.append("根据报错修复 self.play 中裸 Mobject 参数")
-
-        # B. NameError: 未定义符号（颜色常量等）
-        if "NameError" in error_text and "is not defined" in error_text:
-            match = re.search(r"name '([A-Za-z_][A-Za-z0-9_]*)' is not defined", error_text)
-            if match:
-                missing_name = match.group(1)
-                replacement = self.color_fallback_map.get(missing_name, "WHITE")
-                before = fixed
-                fixed = re.sub(rf"\b{re.escape(missing_name)}\b", replacement, fixed)
-                if fixed != before:
-                    fixes.append(f"根据报错修复未定义符号 {missing_name} -> {replacement}")
-
-        # C. run_time <= 0 导致 Manim 无法渲染
-        if "run_time of 0 <= 0 seconds" in error_text or "must be a positive number" in error_text:
-            before = fixed
-            fixed = self._normalize_invalid_run_time(fixed)
-            if fixed != before:
-                fixes.append("根据报错将 run_time<=0 修复为最小正数 0.01")
-
-        # D. Point(location=[...]) 在部分生成结果中不稳定，统一改为不可见 Dot
-        if "Point" in error_text and ("is not defined" in error_text or "unexpected keyword argument 'location'" in error_text):
-            before = fixed
-            fixed = self._replace_point_location_with_hidden_dot(fixed)
-            if fixed != before:
-                fixes.append("根据报错将 Point(location=[...]) 替换为隐藏 Dot(point=[...])")
-
-        # E. SyntaxError: 畸形浮点数（如 run_time=0.01.5）
-        if "SyntaxError" in error_text:
-            before = fixed
-            fixed = self._normalize_invalid_run_time(fixed)
-            if fixed != before:
-                fixes.append("根据 SyntaxError 修复畸形 run_time 浮点数")
-
         return fixed, fixes
 
     def _apply_rule_based_fixes(self, code: str) -> Tuple[str, List[str]]:
@@ -228,13 +185,77 @@ class RepairAgent(BaseAgent):
 
         return pattern.sub(_repl, code)
 
-    def _try_llm_repair(self, code: str) -> Optional[str]:
+    def _format_template_references_for_prompt(
+        self,
+        references: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        refs = list(references or [])
+        if not refs:
+            return "无"
+        lines: List[str] = []
+        for item in refs[:3]:
+            lines.append(
+                "\n".join(
+                    [
+                        f"- 模板ID: {item.get('id', '')}",
+                        f"  命中原因: {item.get('reason', '')}",
+                        f"  helper: {', '.join(item.get('helpers', []) or []) or '无'}",
+                        f"  代码片段:\n```python\n{item.get('excerpt', '')}\n```",
+                    ]
+                )
+            )
+        return "\n\n".join(lines)
+
+    def _select_relevant_template_references(
+        self,
+        render_error: str,
+        template_references: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        refs = list(template_references or [])
+        if not refs:
+            return []
+        lowered = str(render_error or "").lower()
+        keywords = set()
+        if "angle" in lowered:
+            keywords.add("angle")
+        if "rightangle" in lowered or "right angle" in lowered or "perpendicular" in lowered:
+            keywords.add("right_angle")
+        if "arc" in lowered:
+            keywords.add("arc")
+        if "rotate" in lowered or "rotation" in lowered:
+            keywords.add("rotation")
+        if "reflect" in lowered or "fold" in lowered:
+            keywords.add("reflection")
+        if "transform" in lowered:
+            keywords.add("transform")
+        if not keywords:
+            return refs[:2]
+        matched = []
+        for item in refs:
+            haystack = set(item.get("tags", [])) | set(item.get("primitives", [])) | set(item.get("motions", []))
+            if haystack & keywords:
+                matched.append(item)
+        return matched[:3] or refs[:2]
+
+    def _try_llm_repair(
+        self,
+        code: str,
+        render_error: str,
+        template_references: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
         """可选 LLM 修复，返回修复后的完整代码。"""
         prompt = f"""请修复以下 Manim 代码，要求：
 1. 保留原有动画语义
 2. 修复所有语法/运行时错误
 3. 输出完整可运行代码，不得省略
-4. 只输出 python 代码块
+4. 只允许做局部修复，不允许重写整个场景结构
+5. 只输出 python 代码块
+
+当前渲染错误：
+{render_error}
+
+可参考的模板片段（只学习写法，不允许照搬题设和坐标）：
+{self._format_template_references_for_prompt(template_references)}
 
 代码：
 ```python
@@ -302,7 +323,12 @@ class RepairAgent(BaseAgent):
             )
         return fixed
 
-    def _apply_error_driven_fixes(self, code: str, render_error: str) -> Tuple[str, List[str]]:
+    def _apply_error_driven_fixes(
+        self,
+        code: str,
+        render_error: str,
+        template_references: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, List[str]]:
         fixed = code
         fixes: List[str] = []
         error_text = render_error or ""
@@ -363,4 +389,14 @@ class RepairAgent(BaseAgent):
 
         if not fixes:
             fixed, fixes = self._apply_rule_based_fixes(code)
+
+        if (
+            self.llm
+            and self.config.get("use_llm_repair", False)
+            and not fixes
+        ):
+            relevant_refs = self._select_relevant_template_references(render_error, template_references)
+            llm_fixed = self._try_llm_repair(code, render_error, relevant_refs)
+            if llm_fixed and llm_fixed != code:
+                return llm_fixed, ["应用了带模板参考的 LLM 定向修复"]
         return fixed, fixes

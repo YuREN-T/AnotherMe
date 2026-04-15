@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from env_loader import load_project_env
+
 from agents.config import (
     TEXT_API_KEY_ENV_NAME,
     VISION_API_KEY_ENV_NAME,
@@ -18,6 +20,10 @@ from agents.config import (
 )
 from agents.state import AgentState, VideoProject
 from agents.workflow import create_default_workflow
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
 
 
 class MathVideoGenerator:
@@ -36,7 +42,7 @@ class MathVideoGenerator:
         self,
         image_path: str,
         problem_text: Optional[str] = None,
-        output_dir: str = "./output",
+        output_dir: str = str(DEFAULT_OUTPUT_DIR),
         geometry_file: Optional[str] = None,
         export_ggb: bool = True,
     ) -> str:
@@ -93,6 +99,7 @@ def _resolve_api_key() -> str:
     return (
         os.getenv(TEXT_API_KEY_ENV_NAME)
         or os.getenv(VISION_API_KEY_ENV_NAME)
+        or os.getenv("QWEN_API_KEY")
         or os.getenv("DASHSCOPE_API_KEY")
         or os.getenv("BAILIAN_API_KEY")
         or os.getenv("ARK_API_KEY")
@@ -101,13 +108,15 @@ def _resolve_api_key() -> str:
 
 
 def main():
+    load_project_env()
+
     parser = argparse.ArgumentParser(
         description="Generate a math-solution video from a problem image.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python main.py --image problem.png\n"
-            "  python main.py --image problem.png --output_dir ./output_problem2\n"
+            "  python main.py --image problem.png --output_dir ./generated_outputs/default_run\n"
             "  python main.py --image problem.png --api_key sk-xxx\n"
         ),
     )
@@ -130,7 +139,7 @@ def main():
         "--output_dir",
         "-o",
         type=str,
-        default="./output",
+        default=str(DEFAULT_OUTPUT_DIR),
         help="Output directory.",
     )
     parser.add_argument(
@@ -172,7 +181,8 @@ def main():
         print("  1. --api_key your_api_key")
         print("  2. Set DASHSCOPE_API_KEY")
         print("  3. Set BAILIAN_API_KEY")
-        print("  4. Set ARK_API_KEY")
+        print("  4. Set QWEN_API_KEY")
+        print("  5. Set ARK_API_KEY")
         sys.exit(1)
 
     if not Path(args.image).exists():

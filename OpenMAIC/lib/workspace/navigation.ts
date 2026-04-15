@@ -17,38 +17,38 @@ export interface WorkspaceNavItem {
 
 export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
   {
-    title: '互动课堂',
-    subtitle: '从主题直接生成可上课的内容',
+    title: '学习课堂',
+    subtitle: '快速生成本节学习内容',
     href: '/workspace/interactive',
     icon: LayoutDashboard,
   },
   {
     title: '题目视频',
-    subtitle: '把一道题整理成讲解短视频',
+    subtitle: '一道题，一段讲解',
     href: '/workspace/problem-video',
     icon: Camera,
   },
   {
     title: '错题本',
-    subtitle: '沉淀题目、讲解与标签',
+    subtitle: '把错题变成会做题',
     href: '/workspace/notebook',
     icon: NotebookTabs,
   },
   {
-    title: '课堂回看',
-    subtitle: '快速回放历史课程主题',
+    title: '课堂回放',
+    subtitle: '复习以前学过的内容',
     href: '/workspace/review',
     icon: BookOpenCheck,
   },
   {
-    title: '学习计划',
-    subtitle: '安排今日任务与每周节奏',
+    title: '今日计划',
+    subtitle: '安排今天要完成的任务',
     href: '/workspace/plan',
     icon: ListChecks,
   },
   {
-    title: '设置中心',
-    subtitle: '管理模型、语音与偏好',
+    title: '学习设置',
+    subtitle: '调整界面和功能偏好',
     href: '/workspace/settings',
     icon: Settings2,
   },

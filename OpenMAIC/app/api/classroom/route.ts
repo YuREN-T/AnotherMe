@@ -4,6 +4,7 @@ import { apiSuccess, apiError, API_ERROR_CODES } from '@/lib/server/api-response
 import {
   buildRequestOrigin,
   isValidClassroomId,
+  listClassroomSummaries,
   persistClassroom,
   readClassroom,
 } from '@/lib/server/classroom-storage';
@@ -51,13 +52,13 @@ export async function POST(request: NextRequest) {
 export async function GET(request: NextRequest) {
   try {
     const id = request.nextUrl.searchParams.get('id');
+    const limitParam = request.nextUrl.searchParams.get('limit');
 
     if (!id) {
-      return apiError(
-        API_ERROR_CODES.MISSING_REQUIRED_FIELD,
-        400,
-        'Missing required parameter: id',
-      );
+      const parsedLimit = Number(limitParam ?? '20');
+      const limit = Number.isFinite(parsedLimit) ? parsedLimit : 20;
+      const classrooms = await listClassroomSummaries(limit);
+      return apiSuccess({ classrooms });
     }
 
     if (!isValidClassroomId(id)) {

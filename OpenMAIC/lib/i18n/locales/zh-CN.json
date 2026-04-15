@@ -54,7 +54,16 @@
       "empty": "播放课程后，笔记将在此显示",
       "emptyHint": "点击播放按钮开始授课",
       "pageLabel": "第 {{n}} 页",
-      "currentPage": "当前页"
+      "currentPage": "当前页",
+      "editorTitle": "可编辑笔记",
+      "saving": "正在保存",
+      "saved": "已自动保存",
+      "restore": "恢复初始内容",
+      "copy": "复制",
+      "copied": "已复制",
+      "editorPlaceholder": "在这里自由编辑笔记，补充你的理解、例题、疑问或总结...",
+      "referenceTitle": "本次课堂知识点",
+      "referenceHint": "以下内容会作为初始笔记来源，学生可自由修改上方笔记"
     },
     "badge": {
       "qa": "Q&A",

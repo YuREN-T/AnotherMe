@@ -1,3 +1,6 @@
+"""
+场景图数据结构 - 定义几何场景的点、线、对象、角度等数据结构
+"""
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 

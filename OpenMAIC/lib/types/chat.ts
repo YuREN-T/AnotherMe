@@ -281,6 +281,16 @@ export interface StatelessChatRequest {
   model?: string;
   providerType?: string;
   requiresApiKey?: boolean;
+  persistence?: {
+    enabled: boolean;
+    userId: string;
+    sessionId?: string;
+    title?: string;
+    source?: string;
+    subject?: string;
+    linkedClassroomId?: string;
+    linkedConversationId?: string;
+  };
 }
 
 /**

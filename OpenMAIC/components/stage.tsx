@@ -7,7 +7,6 @@ import { useCanvasStore } from '@/lib/store/canvas';
 import { useSettingsStore } from '@/lib/store/settings';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { SceneSidebar } from './stage/scene-sidebar';
-import { Header } from './header';
 import { CanvasArea } from '@/components/canvas/canvas-area';
 import { Roundtable } from '@/components/roundtable';
 import { PlaybackEngine, computePlaybackView } from '@/lib/playback';
@@ -915,11 +914,10 @@ export function Stage({
       }
     : null;
 
-  // Calculate scene viewer height (subtract Header's 80px height)
+  // Calculate scene viewer height (keep space only for roundtable in playback mode)
   const sceneViewerHeight = (() => {
-    const headerHeight = isPresenting ? 0 : 80; // Header h-20 = 80px
     const roundtableHeight = mode === 'playback' && !isPresenting ? 192 : 0;
-    return `calc(100% - ${headerHeight + roundtableHeight}px)`;
+    return `calc(100% - ${roundtableHeight}px)`;
   })();
 
   return (
@@ -940,9 +938,6 @@ export function Stage({
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col overflow-hidden min-w-0 relative">
-        {/* Header */}
-        {!isPresenting && <Header currentSceneTitle={currentScene?.title || ''} />}
-
         {/* Canvas Area */}
         <div
           className="overflow-hidden relative flex-1 min-h-0 isolate"

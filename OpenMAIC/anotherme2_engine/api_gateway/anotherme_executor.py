@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .storage import ObjectStorage
+try:
+    from output_paths import GATEWAY_OUTPUTS_ROOT
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import GATEWAY_OUTPUTS_ROOT
 
 
 @dataclass
@@ -123,42 +127,52 @@ def run_problem_video_job(
         geometry_local = workdir / "geometry_input.json"
         storage.download_file(geometry_file, str(geometry_local))
 
-    output_dir = workdir / "run_output"
+    output_dir = GATEWAY_OUTPUTS_ROOT / workdir.name / "run_output"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    generator = MathVideoGenerator(
-        llm_config=build_default_llm_config(),
-        vision_config=build_vision_model_config(),
-    )
-
-    final_video_path = generator.generate(
-        image_path=str(input_image_path),
-        problem_text=payload.get("problem_text"),
-        output_dir=str(output_dir),
-        geometry_file=str(geometry_local) if geometry_local else None,
-        export_ggb=True,
-    )
-
-    if not final_video_path or not Path(final_video_path).exists():
-        raise RuntimeError("AnotherMe2 did not produce a final video/audio artifact")
-
-    script_steps_count = len(list((output_dir / "audio").glob("narration_*.mp3")))
-    duration = _probe_duration(final_video_path)
-    debug_bundle = _zip_debug_bundle(output_dir)
-
-    requirement_hint = None
     try:
-        requirement_hint = build_requirement_from_photo(str(input_image_path))
-    except Exception:
-        requirement_hint = None
+        generator = MathVideoGenerator(
+            llm_config=build_default_llm_config(),
+            vision_config=build_vision_model_config(),
+        )
 
-    return ProblemVideoExecutionResult(
-        video_path=final_video_path,
-        duration_sec=duration,
-        script_steps_count=script_steps_count,
-        debug_bundle_path=debug_bundle,
-        requirement_hint=requirement_hint,
-    )
+        final_video_path = generator.generate(
+            image_path=str(input_image_path),
+            problem_text=payload.get("problem_text"),
+            output_dir=str(output_dir),
+            geometry_file=str(geometry_local) if geometry_local else None,
+            export_ggb=True,
+        )
+
+        if not final_video_path or not Path(final_video_path).exists():
+            raise RuntimeError("AnotherMe2 did not produce a final video/audio artifact")
+
+        script_steps_count = len(list((output_dir / "audio").glob("narration_*.mp3")))
+        duration = _probe_duration(final_video_path)
+        debug_bundle = _zip_debug_bundle(output_dir)
+
+        requirement_hint = None
+        try:
+            requirement_hint = build_requirement_from_photo(str(input_image_path))
+        except Exception:
+            requirement_hint = None
+
+        return ProblemVideoExecutionResult(
+            video_path=final_video_path,
+            duration_sec=duration,
+            script_steps_count=script_steps_count,
+            debug_bundle_path=debug_bundle,
+            requirement_hint=requirement_hint,
+        )
+    except Exception:
+        # If execution fails before upload stage, clean persistent artifacts here.
+        run_root = output_dir.parent
+        shutil.rmtree(output_dir, ignore_errors=True)
+        try:
+            if run_root.exists() and not any(run_root.iterdir()):
+                run_root.rmdir()
+        except OSError:
+            pass
+        raise
 
 
 def synthesize_problem_image_from_text(

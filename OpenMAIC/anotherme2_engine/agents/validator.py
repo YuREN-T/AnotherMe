@@ -1,3 +1,6 @@
+"""
+场景验证器 - 验证场景图的完整性和一致性
+"""
 class SceneValidator:
 
     @staticmethod

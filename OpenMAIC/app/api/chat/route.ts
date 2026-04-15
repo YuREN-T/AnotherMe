@@ -19,10 +19,55 @@ import type { ThinkingConfig } from '@/lib/types/provider';
 import { apiError } from '@/lib/server/api-response';
 import { createLogger } from '@/lib/logger';
 import { resolveModel } from '@/lib/server/resolve-model';
+import {
+  createGatewayAIMessage,
+  createGatewayAISession,
+} from '@/lib/server/anotherme2-gateway';
 const log = createLogger('Chat API');
 
 // Allow streaming responses up to 60 seconds
 export const maxDuration = 60;
+
+function extractTextFromMessage(message: unknown): string {
+  if (!message || typeof message !== 'object') return '';
+
+  const maybeContent = (message as { content?: unknown }).content;
+  if (typeof maybeContent === 'string' && maybeContent.trim()) {
+    return maybeContent.trim();
+  }
+
+  const parts = (message as { parts?: unknown }).parts;
+  if (!Array.isArray(parts)) return '';
+
+  const text = parts
+    .map((part) => {
+      if (!part || typeof part !== 'object') return '';
+      const t = (part as { text?: unknown }).text;
+      return typeof t === 'string' ? t : '';
+    })
+    .join('')
+    .trim();
+
+  return text;
+}
+
+function extractLatestUserMessage(messages: unknown): { messageId: string; content: string } | null {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const item = messages[i];
+    if (!item || typeof item !== 'object') continue;
+    const role = (item as { role?: unknown }).role;
+    if (role !== 'user') continue;
+    const content = extractTextFromMessage(item);
+    if (!content) continue;
+
+    const rawId = (item as { id?: unknown }).id;
+    const messageId =
+      typeof rawId === 'string' && rawId.trim() ? rawId.trim() : `fallback-user-${i}`;
+    return { messageId, content };
+  }
+  return null;
+}
 
 /**
  * POST /api/chat
@@ -80,6 +125,40 @@ export async function POST(req: NextRequest) {
       `Agents: ${body.config.agentIds.join(', ')}, Messages: ${body.messages.length}, Turn: ${body.directorState?.turnCount ?? 0}`,
     );
 
+    let persistenceSessionId: string | undefined;
+    const persistenceUserId = body.persistence?.enabled ? body.persistence.userId?.trim() : '';
+    const latestUserMessage = extractLatestUserMessage(body.messages);
+
+    if (body.persistence?.enabled && persistenceUserId) {
+      try {
+        persistenceSessionId = body.persistence.sessionId;
+        if (!persistenceSessionId) {
+          const created = await createGatewayAISession({
+            userId: persistenceUserId,
+            title: (body.persistence.title || '课堂对话').trim() || '课堂对话',
+            source: body.persistence.source || '课堂互动',
+            subject: body.persistence.subject,
+            linkedClassroomId: body.persistence.linkedClassroomId,
+            linkedConversationId: body.persistence.linkedConversationId,
+          });
+          persistenceSessionId = created.session_id;
+        }
+
+        if (latestUserMessage) {
+          await createGatewayAIMessage({
+            sessionId: persistenceSessionId,
+            role: 'user',
+            userId: persistenceUserId,
+            content: latestUserMessage.content,
+            contentType: 'text',
+            requestId: `chat-user-${persistenceSessionId}-${latestUserMessage.messageId}`,
+          });
+        }
+      } catch (error) {
+        log.warn('Chat persistence setup failed, continue without persistence:', error);
+      }
+    }
+
     // Use the native request signal for abort propagation
     const signal = req.signal;
 
@@ -113,6 +192,9 @@ export async function POST(req: NextRequest) {
       try {
         startHeartbeat();
 
+        let assistantText = '';
+        let wasAborted = false;
+
         const generator = statelessGenerate(
           {
             ...body,
@@ -126,11 +208,35 @@ export async function POST(req: NextRequest) {
         for await (const event of generator) {
           if (signal.aborted) {
             log.info('Request was aborted');
+            wasAborted = true;
             break;
+          }
+
+          if (event.type === 'text_delta') {
+            const delta = event.data?.content;
+            if (typeof delta === 'string' && delta) {
+              assistantText += delta;
+            }
           }
 
           const data = `data: ${JSON.stringify(event)}\n\n`;
           await writer.write(encoder.encode(data));
+        }
+
+        if (!wasAborted && persistenceSessionId && assistantText.trim()) {
+          try {
+            await createGatewayAIMessage({
+              sessionId: persistenceSessionId,
+              role: 'assistant',
+              userId: persistenceUserId,
+              content: assistantText.trim(),
+              contentType: 'text',
+              modelName: body.model,
+              requestId: `chat-assistant-${persistenceSessionId}-${latestUserMessage?.messageId || 'none'}-turn-${body.directorState?.turnCount ?? 0}`,
+            });
+          } catch (error) {
+            log.warn('Failed to persist assistant response after stream:', error);
+          }
         }
 
         stopHeartbeat();
@@ -175,6 +281,7 @@ export async function POST(req: NextRequest) {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        ...(persistenceSessionId ? { 'x-ai-session-id': persistenceSessionId } : {}),
       },
     });
   } catch (error) {

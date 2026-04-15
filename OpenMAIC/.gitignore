@@ -47,6 +47,11 @@ yarn-error.log*
 .env*
 !.env.example
 
+# python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # server provider config (contains API keys)
 server-providers.yml
 server-providers-*.yml
@@ -68,6 +73,17 @@ next-env.d.ts
 # generated data
 /data
 /logs
+/anotherme2_engine/generated_outputs/
+/anotherme2_engine/output/
+/anotherme2_engine/output_problem*/
+/anotherme2_engine/media/videos/
+/anotherme2_engine/gateway_data/
+/anotherme2_engine/gateway_data/tmp/
+/anotherme2_engine/gateway.db
+/anotherme2_engine/template/media/videos/
+/anotherme2_engine/template/media/
+/anotherme2_engine/template/manim_templates/media/
+/anotherme2_engine/template/manim_templates/validation_media/
 
 # docs
 /docs

@@ -54,7 +54,16 @@
       "empty": "Notes will appear here after lecture playback",
       "emptyHint": "Press play to start the lecture",
       "pageLabel": "Page {{n}}",
-      "currentPage": "Current"
+      "currentPage": "Current",
+      "editorTitle": "Editable Notes",
+      "saving": "Saving",
+      "saved": "Auto-saved",
+      "restore": "Restore initial notes",
+      "copy": "Copy",
+      "copied": "Copied",
+      "editorPlaceholder": "Freely edit your notes here. Add understanding, examples, questions, or summaries...",
+      "referenceTitle": "Lesson Key Points",
+      "referenceHint": "These points seed the initial notes, and students can freely revise the editor above"
     },
     "badge": {
       "qa": "Q&A",

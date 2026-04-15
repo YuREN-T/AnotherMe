@@ -1,3 +1,6 @@
+"""
+动画规划器 - 将脚本步骤转换为结构化动画计划，供代码生成器使用
+"""
 import re
 from typing import Any, Dict, List
 
@@ -61,8 +64,22 @@ class AnimationPlanner:
         # 优先使用脚本侧结构化屏幕文案（允许描述性文字进入公式区）
         on_screen_items = getattr(step, "on_screen_texts", []) or []
         prioritized = self._extract_from_on_screen_texts(on_screen_items)
+        max_items = 6
         if prioritized:
-            return prioritized[:4]
+            # 若结构化文案较少，补充从旁白/视觉中抽取到的公式片段，避免单幕信息过少。
+            seen = {item for item in prioritized}
+            extras: List[str] = []
+            texts = [step.title, *step.visual_cues, step.narration]
+            for text in texts:
+                if not text:
+                    continue
+                for match in self._extract_formula_fragments(str(text)):
+                    cleaned = self._normalize_formula_candidate(match)
+                    if not cleaned or cleaned in seen:
+                        continue
+                    seen.add(cleaned)
+                    extras.append(cleaned)
+            return (prioritized + extras)[:max_items]
 
         # 兜底：兼容旧脚本，仅从标题/视觉/旁白中提取公式样式文本
         candidates: List[str] = []
@@ -79,7 +96,7 @@ class AnimationPlanner:
                 seen.add(cleaned)
                 candidates.append(cleaned)
 
-        return candidates[:4]
+        return candidates[:max_items]
 
     def _extract_from_on_screen_texts(self, items: List[Dict[str, Any]]) -> List[str]:
         scored: List[tuple] = []

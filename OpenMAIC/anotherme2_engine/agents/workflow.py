@@ -3,7 +3,7 @@ LangGraph 工作流定义
 使用并行架构 - 所有智能体共享视觉工具
 """
 import subprocess
-from typing import Dict, Any
+from typing import Dict, Any, Optional, cast
 from langgraph.graph import StateGraph, END
 
 from .state import AgentState, VideoProject
@@ -12,9 +12,15 @@ from .animation_agent import AnimationAgent
 from .repair_agent import RepairAgent
 from .voice_agent import VoiceAgent
 from .merge_agent import MergeAgent
+from .learner_modeling_agent import LearnerModelingAgent
 from .vision_agent import VisionAgent
 from .vision_tool import VisionTool
 from .config import MANIM_CANVAS_CONFIG
+from .state_contracts import wrap_agent_node
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
 
 
 def _detect_latex_support() -> bool:
@@ -42,40 +48,44 @@ def _detect_latex_support() -> bool:
 
 def create_workflow(
     vision_agent: VisionAgent,
+    learner_modeling_agent: LearnerModelingAgent,
     script_agent: ScriptAgent,
     animation_agent: AnimationAgent,
     repair_agent: RepairAgent,
     voice_agent: VoiceAgent,
     merge_agent: MergeAgent,
     vision_tool: VisionTool
-) -> StateGraph:
+) -> Any:
     """
     创建 LangGraph 工作流
 
     工作流程（先生成音频，再生成动画，实现音画同步）：
     1. Vision    ← 图片（识别题目 + Scene Graph）
-    2. Script    ← 题目文字 + 图片
-    3. Voice     ← 脚本（先跑，获取真实音频时长）
-    4. Animation ← 脚本 + 音频时长 + Scene Graph（按真实时长生成动画 + add_sound）
-    5. Repair    ← 自动修复常见 Manim 错误
-    6. Merge     → 输出
+    2. Learner   ← 学情建模（知识差距分析 + 策略分发）
+    3. Script    ← 题目文字 + 图片 + 学情策略
+    4. Voice     ← 脚本（先跑，获取真实音频时长）
+    5. Animation ← 脚本 + 音频时长 + Scene Graph（按真实时长生成动画 + add_sound）
+    6. Repair    ← 自动修复常见 Manim 错误
+    7. Merge     → 输出
     """
     builder = StateGraph(AgentState)
 
     # 添加节点
-    builder.add_node("vision", vision_agent.process)
-    builder.add_node("script", script_agent.process)
-    builder.add_node("animation", animation_agent.process)
-    builder.add_node("repair", repair_agent.process)
-    builder.add_node("voice", voice_agent.process)
-    builder.add_node("merge", merge_agent.process)
+    builder.add_node("vision", cast(Any, wrap_agent_node("vision", vision_agent.process)))
+    builder.add_node("learner_modeling", cast(Any, wrap_agent_node("learner_modeling", learner_modeling_agent.process)))
+    builder.add_node("script", cast(Any, wrap_agent_node("script", script_agent.process)))
+    builder.add_node("animation", cast(Any, wrap_agent_node("animation", animation_agent.process)))
+    builder.add_node("repair", cast(Any, wrap_agent_node("repair", repair_agent.process)))
+    builder.add_node("voice", cast(Any, wrap_agent_node("voice", voice_agent.process)))
+    builder.add_node("merge", cast(Any, wrap_agent_node("merge", merge_agent.process)))
 
     # 设置入口
     builder.set_entry_point("vision")
 
     # 顺序流程
     # voice 先于 animation，确保音频时长和路径已知
-    builder.add_edge("vision", "script")
+    builder.add_edge("vision", "learner_modeling")
+    builder.add_edge("learner_modeling", "script")
     builder.add_edge("script", "voice")
     builder.add_edge("voice", "animation")
     builder.add_edge("animation", "repair")
@@ -87,15 +97,16 @@ def create_workflow(
 
 
 def create_default_workflow(llm_config: Dict[str, Any],
-                            vision_llm_config: Dict[str, Any] = None,
-                            output_dir: str = "./output",
-                            export_ggb: bool = True) -> StateGraph:
+                            vision_llm_config: Optional[Dict[str, Any]] = None,
+                            output_dir: str = str(DEFAULT_OUTPUT_DIR),
+                            export_ggb: bool = True) -> Any:
     """
     创建默认工作流
 
     所有智能体共享同一个 VisionTool，可以直接分析原图
     """
     from langchain_openai import ChatOpenAI
+    chat_openai_cls: Any = ChatOpenAI
 
     if vision_llm_config is None:
         vision_llm_config = llm_config
@@ -103,21 +114,21 @@ def create_default_workflow(llm_config: Dict[str, Any],
     latex_ready = _detect_latex_support()
 
     # 创建文本 LLM（供 ScriptAgent / VoiceAgent / MergeAgent 使用）
-    llm = ChatOpenAI(
+    llm = chat_openai_cls(
         api_key=llm_config.get("api_key", ""),
         base_url=llm_config.get("base_url", ""),
         model=llm_config.get("model", ""),
         temperature=llm_config.get("temperature", 0.1),
-        max_tokens=llm_config.get("max_tokens", 4096),
+        model_kwargs={"max_tokens": llm_config.get("max_tokens", 4096)},
     )
 
     # AnimationAgent 需要更大的 token 窗口来输出完整代码
-    animation_llm = ChatOpenAI(
+    animation_llm = chat_openai_cls(
         api_key=llm_config.get("api_key", ""),
         base_url=llm_config.get("base_url", ""),
         model=llm_config.get("model", ""),
         temperature=0.05,
-        max_tokens=16384,
+        model_kwargs={"max_tokens": 16384},
     )
 
     # 创建视觉工具（共享给所有需要图像分析的智能体）
@@ -130,12 +141,12 @@ def create_default_workflow(llm_config: Dict[str, Any],
     )
 
     # VisionAgent 使用视觉模型直接生成 OCR 与 Scene Graph
-    vision_llm = ChatOpenAI(
+    vision_llm = chat_openai_cls(
         api_key=vision_llm_config.get("api_key", ""),
         base_url=vision_llm_config.get("base_url", ""),
         model=vision_llm_config.get("model", ""),
         temperature=vision_llm_config.get("temperature", 0.05),
-        max_tokens=vision_llm_config.get("max_tokens", 4096),
+        model_kwargs={"max_tokens": vision_llm_config.get("max_tokens", 4096)},
     )
 
     vision_agent = VisionAgent(
@@ -150,6 +161,13 @@ def create_default_workflow(llm_config: Dict[str, Any],
     )
 
     # 创建智能体 - 都注入 vision_tool，可以按需调用
+    learner_modeling_agent = LearnerModelingAgent(
+        config={
+            "temperature": 0.0,
+        },
+        llm=None,
+    )
+
     script_agent = ScriptAgent(
         config={"temperature": 0.1},
         llm=llm,
@@ -209,6 +227,7 @@ def create_default_workflow(llm_config: Dict[str, Any],
 
     workflow = create_workflow(
         vision_agent=vision_agent,
+        learner_modeling_agent=learner_modeling_agent,
         script_agent=script_agent,
         animation_agent=animation_agent,
         repair_agent=repair_agent,

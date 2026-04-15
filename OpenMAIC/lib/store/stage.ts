@@ -4,6 +4,8 @@ import { createSelectors } from '@/lib/utils/create-selectors';
 import type { ChatSession } from '@/lib/types/chat';
 import type { SceneOutline } from '@/lib/types/generation';
 import { createLogger } from '@/lib/logger';
+import { db } from '@/lib/utils/database';
+import { saveStageData, loadStageData } from '@/lib/utils/stage-storage';
 
 const log = createLogger('StageStore');
 
@@ -200,14 +202,16 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
     // Persist outlines to IndexedDB
     const stageId = get().stage?.id;
     if (stageId) {
-      import('@/lib/utils/database').then(({ db }) => {
-        db.stageOutlines.put({
+      void db.stageOutlines
+        .put({
           stageId,
           outlines,
           createdAt: Date.now(),
           updatedAt: Date.now(),
+        })
+        .catch((error) => {
+          log.warn('Failed to persist outlines:', error);
         });
-      });
     }
   },
 
@@ -255,7 +259,6 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
     }
 
     try {
-      const { saveStageData } = await import('@/lib/utils/stage-storage');
       await saveStageData(stage.id, {
         stage,
         scenes,
@@ -277,11 +280,9 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
         return;
       }
 
-      const { loadStageData } = await import('@/lib/utils/stage-storage');
       const data = await loadStageData(stageId);
 
       // Load outlines for resume-on-refresh
-      const { db } = await import('@/lib/utils/database');
       const outlinesRecord = await db.stageOutlines.get(stageId);
       const outlines = outlinesRecord?.outlines || [];
 

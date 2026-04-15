@@ -67,11 +67,14 @@ class ScriptAgent(BaseAgent):
         semantic_graph = metadata.get("semantic_graph") or metadata.get("scene_graph")
         drawable_scene = metadata.get("drawable_scene")
         geometry_graph = metadata.get("geometry_graph")
+        adaptive_plan = metadata.get("adaptive_plan") if isinstance(metadata.get("adaptive_plan"), dict) else {}
+        learner_profile = metadata.get("learner_profile") if isinstance(metadata.get("learner_profile"), dict) else {}
 
         semantic_graph_text = self._format_structured_geometry_for_prompt(semantic_graph)
         drawable_scene_text = self._format_structured_geometry_for_prompt(drawable_scene)
         geometry_graph_text = self._format_structured_geometry_for_prompt(geometry_graph)
         known_entities_text = ", ".join(self._collect_known_entities(semantic_graph, drawable_scene))
+        adaptive_prompt = self._build_adaptive_prompt(adaptive_plan, learner_profile)
 
         # 回退路径：若结构化信息缺失，再调用视觉描述
         geometry_info = ""
@@ -104,6 +107,12 @@ Geometry Graph（节点/边关系图，辅助约束）：
 题目：{problem_text}
 
 请生成详细的视频脚本。"""
+
+        if adaptive_prompt:
+            user_prompt += f"""
+
+    学情自适应策略（必须执行）：
+    {adaptive_prompt}"""
 
         user_prompt += """
 
@@ -152,6 +161,65 @@ Geometry Graph（节点/边关系图，辅助约束）：
         })
 
         return state
+
+    def _build_adaptive_prompt(self, adaptive_plan: Dict[str, Any], learner_profile: Dict[str, Any]) -> str:
+        if not adaptive_plan:
+            return ""
+
+        mode = str(adaptive_plan.get("mode", "standard") or "standard")
+        review_seconds = int(adaptive_plan.get("review_duration_seconds", 0) or 0)
+        skip_basic = bool(adaptive_plan.get("skip_basic_definition", False))
+        inject_challenge = bool(adaptive_plan.get("inject_challenge_variant", False))
+        analogy_mode = bool(adaptive_plan.get("analogy_mode", False))
+        analogy_domain = str(adaptive_plan.get("analogy_domain", "") or "").strip()
+
+        weak_points: List[str] = []
+        for item in adaptive_plan.get("review_points", []) or []:
+            if not isinstance(item, dict):
+                continue
+            kp = str(item.get("knowledge", "")).strip()
+            if kp:
+                weak_points.append(kp)
+
+        learner_grade = learner_profile.get("grade", "unknown")
+        required_mastery_avg = self._safe_float(adaptive_plan.get("required_mastery_avg", 0.5), 0.5)
+        prerequisite_mastery_avg = self._safe_float(adaptive_plan.get("prerequisite_mastery_avg", 0.5), 0.5)
+
+        lines = [
+            f"- 当前模式: {mode}",
+            f"- 学生年级: {learner_grade}",
+            f"- 目标知识平均掌握度: {required_mastery_avg:.2f}",
+            f"- 前置知识平均掌握度: {prerequisite_mastery_avg:.2f}",
+        ]
+
+        if weak_points:
+            lines.append(f"- 优先补齐薄弱点: {', '.join(weak_points)}")
+
+        if mode == "remedial":
+            lines.append(f"- 开头必须插入约 {max(20, review_seconds)}~40 秒前置复习，先讲薄弱前置再解题")
+            lines.append("- 每步旁白更慢、更短句，关键结论重复一次")
+            lines.append("- visual_cues 中加入明确视觉支架提示，例如：高亮辅助线/关键点闪烁/步骤编号")
+        elif mode == "advanced":
+            lines.append("- 跳过基础定义，直接进入解题结构、变式与迁移")
+            lines.append("- 至少追加一个思维拔高点或反例提醒")
+        else:
+            lines.append("- 保持标准讲解节奏，关键步骤保留必要解释")
+
+        if skip_basic:
+            lines.append("- 避免重复基础概念定义")
+        if inject_challenge:
+            lines.append("- 在结尾加入一个简短变式挑战")
+
+        if analogy_mode and analogy_domain:
+            lines.append(f"- 优先采用 {analogy_domain} 类比来解释数学关系（不改变数学严谨性）")
+
+        return "\n".join(lines)
+
+    def _safe_float(self, value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """解析 LLM 返回的 JSON 响应"""

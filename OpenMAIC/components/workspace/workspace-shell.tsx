@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { AnimatePresence, motion } from 'motion/react';
-import { CalendarDays, ChevronRight, Menu, X } from 'lucide-react';
+import { ChevronRight, Menu, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { WORKSPACE_NAV_ITEMS } from '@/lib/workspace/navigation';
 
@@ -14,18 +14,39 @@ interface WorkspaceShellProps {
 
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
+  const activeItem = WORKSPACE_NAV_ITEMS.find((item) => pathname.startsWith(item.href));
 
   return (
     <>
-      <div className="mb-6 flex items-center gap-3 px-2">
-        <div className="workspace-logo-badge workspace-cn-serif text-base font-semibold">A</div>
-        <div>
-          <p className="workspace-brand">AnotherMe 学习工作台</p>
-          <p className="workspace-brand-sub">面向中文课堂的简约创作界面</p>
+      <div className="mb-8 px-2">
+        <div className="mb-4 flex items-center gap-3">
+          <div className="workspace-logo-badge workspace-cn-serif text-base font-semibold">A</div>
+          <div>
+            <p className="workspace-brand">AnotherMe 学习站</p>
+            <p className="mt-1 text-xs text-[#8a7f73]">课程、任务与复习一体化</p>
+          </div>
+        </div>
+
+        <div className="border-l-2 border-[#cab9a6] pl-3">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-[#9b8d80]">
+            当前场景
+          </p>
+          <p className="mt-3 text-lg font-semibold tracking-[-0.03em] text-[#241d18]">
+            {activeItem?.title ?? '学习站'}
+          </p>
+          <p className="mt-1 text-sm leading-6 text-[#807366]">
+            {activeItem?.subtitle ?? '把今天最重要的学习动作推进下去。'}
+          </p>
         </div>
       </div>
 
-      <nav className="space-y-2">
+      <div className="mb-3 px-2">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.26em] text-[#a49486]">
+          Workspace
+        </p>
+      </div>
+
+      <nav className="space-y-2.5">
         {WORKSPACE_NAV_ITEMS.map((item) => {
           const Icon = item.icon;
           const isActive = pathname.startsWith(item.href);
@@ -41,21 +62,17 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
                 <Icon className="h-4 w-4" />
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block text-sm font-semibold">{item.title}</span>
-                <span className="block truncate text-xs text-[#8a7b6d]">{item.subtitle}</span>
+                <span className="block truncate text-sm font-semibold">{item.title}</span>
+                <span className="mt-1 block truncate text-xs text-[#9a8c7d]">{item.subtitle}</span>
               </span>
-              <ChevronRight className="h-4 w-4 text-[#b3a596]" />
+              <ChevronRight className="h-4 w-4 text-[#b9ab9c]" />
             </Link>
           );
         })}
       </nav>
 
-      <div className="workspace-side-card mt-6">
-        <p className="text-xs tracking-[0.2em] text-[#8b7864]">今日建议</p>
-        <p className="mt-2 text-sm font-semibold text-[#312821]">先定目标，再生成结构</p>
-        <p className="mt-1 text-xs leading-6 text-[#786c61]">
-          主题写得越具体，后续课堂、视频和错题沉淀就越顺手。
-        </p>
+      <div className="mt-auto px-2 pt-6">
+        <p className="text-xs leading-6 text-[#877a6d]">今天也保持学习节奏，完成最关键的一步。</p>
       </div>
     </>
   );
@@ -69,28 +86,19 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
     return WORKSPACE_NAV_ITEMS.find((item) => pathname.startsWith(item.href));
   }, [pathname]);
 
-  const headerCopy = useMemo(() => {
+  const headerTitle = useMemo(() => {
     if (pathname.startsWith('/workspace/classroom/')) {
-      return {
-        title: '课堂回放',
-        subtitle: '在工作台内继续沉浸式浏览与全屏播放',
-      };
+      return '课堂播放';
     }
 
     if (
       pathname.startsWith('/generation-preview') ||
       pathname.startsWith('/workspace/generation-preview')
     ) {
-      return {
-        title: '课堂生成中',
-        subtitle: '正在整理结构、内容与课堂动作，请稍候片刻',
-      };
+      return '正在准备内容';
     }
 
-    return {
-      title: activeItem?.title ?? '学习工作台',
-      subtitle: activeItem?.subtitle ?? '用统一的中文界面管理生成、复盘与设置',
-    };
+    return activeItem?.title ?? '学习站';
   }, [activeItem, pathname]);
 
   const today = useMemo(() => {
@@ -144,14 +152,15 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
             </button>
 
             <div className="workspace-topbar-copy">
-              <p className="workspace-topbar-title">{headerCopy.title}</p>
-              <p className="workspace-topbar-subtitle">{headerCopy.subtitle}</p>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-[#9b8d80]">
+                Learning Dashboard
+              </p>
+              <p className="workspace-topbar-title">{headerTitle}</p>
             </div>
           </div>
 
-          <div className="workspace-topbar-badge">
-            <CalendarDays className="h-3.5 w-3.5" />
-            {today}
+          <div className="flex items-center gap-3">
+            <p className="text-xs font-medium text-[#8c8075]">{today}</p>
           </div>
         </header>
 

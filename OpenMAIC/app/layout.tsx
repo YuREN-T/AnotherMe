@@ -1,5 +1,5 @@
 import type { Metadata } from 'next';
-import { Noto_Sans_SC, Noto_Serif_SC } from 'next/font/google';
+import { Inter } from 'next/font/google';
 import './globals.css';
 import 'animate.css';
 import 'katex/dist/katex.min.css';
@@ -8,35 +8,20 @@ import { I18nProvider } from '@/lib/hooks/use-i18n';
 import { Toaster } from '@/components/ui/sonner';
 import { ServerProvidersInit } from '@/components/server-providers-init';
 
-const notoSansSc = Noto_Sans_SC({
+const inter = Inter({
   subsets: ['latin'],
-  variable: '--font-sans-workspace',
-  weight: ['400', '500', '600', '700'],
-});
-
-const notoSerifSc = Noto_Serif_SC({
-  subsets: ['latin'],
-  variable: '--font-serif-workspace',
-  weight: ['400', '500', '600', '700'],
+  variable: '--font-sans',
 });
 
 export const metadata: Metadata = {
-  title: 'AnotherMe 学习工作台',
-  description: '面向中文学习场景的 AI 课程生成与复盘工作台。',
+  title: 'EduMetrics - AI 教育平台',
+  description: 'AI 驱动的教育平台，用于创建互动课堂和解答问题。',
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html
-      lang="zh-CN"
-      className={`${notoSansSc.variable} ${notoSerifSc.variable}`}
-      suppressHydrationWarning
-    >
-      <body className="antialiased" suppressHydrationWarning>
+    <html lang="zh-CN" className={`${inter.variable}`} suppressHydrationWarning>
+      <body className="font-sans antialiased" suppressHydrationWarning>
         <ThemeProvider>
           <I18nProvider>
             <ServerProvidersInit />

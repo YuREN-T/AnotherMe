@@ -1,3 +1,6 @@
+"""
+几何图构建器 - 使用 NetworkX 构建几何图形的图结构表示
+"""
 import networkx as nx
 
 

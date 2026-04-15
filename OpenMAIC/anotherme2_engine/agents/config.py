@@ -5,6 +5,18 @@ Model and runtime configuration.
 import os
 from typing import Any, Dict, Iterable, Union
 
+try:
+    from env_loader import load_project_env
+except ModuleNotFoundError:
+    from anotherme2_engine.env_loader import load_project_env
+try:
+    from output_paths import DEFAULT_OUTPUT_DIR
+except ModuleNotFoundError:
+    from anotherme2_engine.output_paths import DEFAULT_OUTPUT_DIR
+
+
+load_project_env()
+
 
 def _read_api_key_from_env_name(env_name: Union[str, Iterable[str]]) -> str:
     if isinstance(env_name, str):
@@ -24,7 +36,10 @@ def _read_api_key_from_env_name(env_name: Union[str, Iterable[str]]) -> str:
 
 # Fill these with your own environment variable names if you want to use
 # Alibaba DashScope compatible-mode models.
-DASHSCOPE_API_KEY_ENV_NAMES = ("DASHSCOPE_API_KEY", "BAILIAN_API_KEY")
+# ``QWEN_*`` aliases are included because the unified OpenMAIC app exposes
+# provider settings with those names in ``OpenMAIC/.env.local``.
+DASHSCOPE_API_KEY_ENV_NAMES = ("DASHSCOPE_API_KEY", "BAILIAN_API_KEY", "QWEN_API_KEY")
+DASHSCOPE_BASE_URL_ENV_NAMES = ("DASHSCOPE_BASE_URL", "BAILIAN_BASE_URL", "QWEN_BASE_URL")
 TEXT_API_KEY_ENV_NAME = DASHSCOPE_API_KEY_ENV_NAMES[0]
 VISION_API_KEY_ENV_NAME = DASHSCOPE_API_KEY_ENV_NAMES[0]
 
@@ -54,16 +69,18 @@ def _vision_api_key() -> str:
 
 
 def _text_base_url() -> str:
-    return (
-        DASHSCOPE_COMPAT_BASE_URL
-        if _read_api_key_from_env_name(DASHSCOPE_API_KEY_ENV_NAMES)
-        else FALLBACK_ARK_BASE_URL
-    )
+    compatible_api_key = _read_api_key_from_env_name(DASHSCOPE_API_KEY_ENV_NAMES)
+    compatible_base_url = _read_api_key_from_env_name(DASHSCOPE_BASE_URL_ENV_NAMES)
+    if compatible_api_key:
+        return compatible_base_url or DASHSCOPE_COMPAT_BASE_URL
+    return FALLBACK_ARK_BASE_URL
 
 
 def _vision_base_url() -> str:
-    if _read_api_key_from_env_name(DASHSCOPE_API_KEY_ENV_NAMES):
-        return DASHSCOPE_COMPAT_BASE_URL
+    compatible_api_key = _read_api_key_from_env_name(DASHSCOPE_API_KEY_ENV_NAMES)
+    compatible_base_url = _read_api_key_from_env_name(DASHSCOPE_BASE_URL_ENV_NAMES)
+    if compatible_api_key:
+        return compatible_base_url or DASHSCOPE_COMPAT_BASE_URL
     return FALLBACK_ARK_BASE_URL
 
 
@@ -123,7 +140,7 @@ VOICE_MODEL_CONFIG = build_voice_model_config()
 TTS_CONFIG = build_tts_config()
 
 VIDEO_CONFIG = {
-    "output_dir": "./output",
+    "output_dir": str(DEFAULT_OUTPUT_DIR),
     "resolution": "1920x1080",
     "fps": 60,
     "format": "mp4",
@@ -151,12 +168,19 @@ AGENT_CONFIGS: Dict[str, Dict[str, Any]] = {
         "system_prompt_file": "prompts/animation_agent.txt",
         "canvas_config": MANIM_CANVAS_CONFIG,
         "layout": "left_graph_right_formula",
+        "use_template_retrieval": True,
+        "template_retrieval_top_k": 3,
+        "template_retrieval_mode": "component",
+        "template_retrieval_allow_full_scene_fallback": True,
+        "export_incremental_codegen_debug": False,
     },
     "voice": {
         "temperature": 0.05,
         "max_tokens": 2048,
         "system_prompt_file": "prompts/voice_agent.txt",
         "tts_config": TTS_CONFIG,
+        "tts_concurrency": 3,
+        "narration_optimization_concurrency": 3,
     },
     "merge": {
         "temperature": 0.05,

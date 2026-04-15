@@ -54,7 +54,16 @@
       "empty": "講義の再生後にノートがここに表示されます",
       "emptyHint": "再生ボタンを押して講義を開始してください",
       "pageLabel": "ページ {{n}}",
-      "currentPage": "現在"
+      "currentPage": "現在",
+      "editorTitle": "編集可能ノート",
+      "saving": "保存中",
+      "saved": "自動保存済み",
+      "restore": "初期ノートに戻す",
+      "copy": "コピー",
+      "copied": "コピー済み",
+      "editorPlaceholder": "ここで自由にノートを編集し、理解、例題、疑問、まとめを追加できます...",
+      "referenceTitle": "今回の授業の知識ポイント",
+      "referenceHint": "以下の内容が初期ノートの元になります。上のノートは自由に編集できます"
     },
     "badge": {
       "qa": "Q&A",

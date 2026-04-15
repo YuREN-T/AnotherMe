@@ -1,7 +1,7 @@
 """
 状态定义 - 用于 LangGraph 的状态管理
 """
-from typing import Dict, List, Any, Optional, TypedDict, Annotated
+from typing import Dict, List, Any, Optional, TypedDict
 from dataclasses import dataclass, field
 
 

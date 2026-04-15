@@ -1,14 +1,33 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import Link from 'next/link';
+import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion } from 'motion/react';
-import { ArrowRight, BookOpen, FileUp, Languages, Loader2 } from 'lucide-react';
+import {
+  ArrowRight,
+  BookOpenCheck,
+  Clock3,
+  FileUp,
+  Languages,
+  Loader2,
+  Search,
+  Sparkles,
+  Target,
+  Wand2,
+} from 'lucide-react';
 import { nanoid } from 'nanoid';
-import { listStages, type StageListItem } from '@/lib/utils/stage-storage';
+import {
+  MiniBarChart,
+  WorkspaceHero,
+  WorkspaceMetricCard,
+  WorkspacePanel,
+  WorkspaceProfilePanel,
+  workspaceToneClass,
+} from '@/components/workspace/workspace-dashboard';
 import { storePdfBlob } from '@/lib/utils/image-storage';
+import { listStages, type StageListItem } from '@/lib/utils/stage-storage';
 import { useUserProfileStore } from '@/lib/store/user-profile';
+import { cn } from '@/lib/utils';
 
 interface FormState {
   topic: string;
@@ -25,18 +44,27 @@ const initialForm: FormState = {
 };
 
 const topicTemplates = [
-  '用生活案例讲清一次函数，并设计课堂互动提问',
-  '把光合作用做成实验导向课，包含课堂演示与讨论',
-  '用动画思路讲解勾股定理，配两道分层练习题',
-];
+  {
+    title: '一次函数入门',
+    note: '概念 + 图像 + 2 道基础题',
+    value: '初二数学：一次函数，先讲概念，再做2道基础题和1道应用题',
+    tone: 'peach',
+  },
+  {
+    title: '光合作用实验',
+    note: '实验观察 + 总结结论',
+    value: '初中生物：光合作用，通过实验观察并总结光反应与暗反应',
+    tone: 'mint',
+  },
+  {
+    title: '勾股定理强化',
+    note: '证明 + 例题 + 练习',
+    value: '初二几何：勾股定理，配1道证明题、1道例题和1道练习',
+    tone: 'violet',
+  },
+] as const;
 
-const outputHighlights = [
-  '自动拆解教学目标、难点与课堂节奏',
-  '生成可继续编辑的 PPT 课程骨架',
-  '补充互动提问、练习题与案例延展',
-];
-
-const workflowSteps = ['写清主题与目标', '生成课堂首版', '进入教室继续打磨'];
+const scenePills = ['课堂生成', '题目讲解', '错题复习', '学习计划'];
 
 export default function InteractiveWorkspacePage() {
   const router = useRouter();
@@ -44,20 +72,33 @@ export default function InteractiveWorkspacePage() {
   const [recentStages, setRecentStages] = useState<StageListItem[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const topicLength = form.topic.trim().length;
+  const avatar = useUserProfileStore((state) => state.avatar);
+  const nickname = useUserProfileStore((state) => state.nickname);
+  const bio = useUserProfileStore((state) => state.bio);
 
   useEffect(() => {
     let mounted = true;
 
     listStages().then((items) => {
-      if (!mounted) return;
-      setRecentStages(items.slice(0, 5));
+      if (mounted) {
+        setRecentStages(items.slice(0, 5));
+      }
     });
 
     return () => {
       mounted = false;
     };
   }, []);
+
+  const topicLength = form.topic.trim().length;
+
+  const activityBars = useMemo(() => {
+    const base = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const values = base.map((_, index) =>
+      Math.max(2, (recentStages[index]?.sceneCount ?? 0) + index + 1),
+    );
+    return { labels: base, values };
+  }, [recentStages]);
 
   async function handleGenerateLesson() {
     if (!form.topic.trim()) {
@@ -84,259 +125,348 @@ export default function InteractiveWorkspacePage() {
         requirements: {
           requirement: form.topic,
           language: form.language,
+          webSearch: form.withWebSearch,
           userNickname: profile.nickname || undefined,
           userBio: profile.bio || undefined,
-          webSearch: form.withWebSearch,
         },
         pdfText: '',
-        pdfImages: [],
-        imageStorageIds: [],
+        currentStep: 'generating' as const,
         pdfStorageKey,
         pdfFileName,
-        pdfProviderId: undefined,
-        pdfProviderConfig: undefined,
-        sceneOutlines: null,
-        currentStep: 'generating' as const,
       };
 
       sessionStorage.setItem('generationSession', JSON.stringify(generationSession));
       router.push('/workspace/generation-preview');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '启动课程生成失败，请稍后重试。');
-    } finally {
+    } catch {
+      setError('准备生成时出错，请重试。');
       setSubmitting(false);
     }
   }
 
   return (
-    <div className="workspace-cn-font space-y-6 text-[#2e2822]">
-      <motion.section
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4 }}
-        className="workspace-hero-card"
-      >
-        <div className="grid gap-6 lg:grid-cols-[1.45fr_0.75fr] lg:items-end">
-          <div>
-            <p className="workspace-eyebrow">互动课堂工作台</p>
-            <h1 className="workspace-title">把一个主题打磨成一节能直接上课的中文课堂。</h1>
-            <p className="workspace-subtitle">
-              你只需要描述学生要学会什么、课堂想怎么展开，系统会先帮你生成结构清晰的课件骨架，再进入教室继续精修内容、动作和讲解节奏。
-            </p>
-
-            <div className="mt-5 flex flex-wrap gap-2">
-              <span className="workspace-chip">中文界面</span>
-              <span className="workspace-chip-muted">暖纸感视觉</span>
-              <span className="workspace-chip-muted">支持参考 PDF</span>
-            </div>
-          </div>
-
-          <div className="workspace-panel">
-            <p className="text-xs font-semibold tracking-[0.18em] text-[#8b7864]">本页节奏</p>
-            <div className="mt-3 space-y-2.5">
-              {workflowSteps.map((step, index) => (
-                <div key={step} className="flex items-center gap-3">
-                  <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#2d2722] text-xs font-semibold text-[#faf5ee]">
-                    {index + 1}
-                  </span>
-                  <p className="text-sm font-medium text-[#4c433a]">{step}</p>
-                </div>
-              ))}
-            </div>
-            <div className="mt-4 grid gap-3 border-t border-[#ece1d3] pt-4 sm:grid-cols-2">
-              <div>
-                <p className="text-xs text-[#8e7d6d]">生成时长</p>
-                <p className="mt-1 text-lg font-semibold text-[#2c251f]">约 3-5 分钟</p>
-              </div>
-              <div>
-                <p className="text-xs text-[#8e7d6d]">适合场景</p>
-                <p className="mt-1 text-lg font-semibold text-[#2c251f]">备课 / 试讲 / 复盘</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      </motion.section>
-
-      <div className="grid gap-5 xl:grid-cols-[1.45fr_1fr]">
-        <motion.section
-          initial={{ opacity: 0, y: 24 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.08, duration: 0.36 }}
-          className="workspace-panel p-6"
+    <div className="space-y-4">
+      <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }}>
+        <WorkspaceHero
+          eyebrow="Lesson Studio"
+          title="像搭积木一样，快速拼出下一节课堂。"
+          description="借鉴模板中的圆角卡片、主副分区与柔和配色，把输入流程聚焦在一个主舞台里。你只要填核心信息，系统会把后续生成链路自动接起来。"
+          badges={[
+            'Pastel 主舞台',
+            '支持 PDF 参考资料',
+            form.withWebSearch ? '已启用联网搜索' : '本次关闭联网搜索',
+          ]}
+          tone="sky"
         >
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="text-xl font-semibold text-[#26201b]">课程输入</h2>
-              <p className="mt-1 text-sm text-[#786d62]">用完整句描述目标、对象和课堂方式，首版结果会明显更稳。</p>
-            </div>
-            <span className="workspace-chip">智能结构生成</span>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <WorkspaceMetricCard
+              label="当前草稿"
+              value={topicLength ? `${topicLength} 字` : '待输入'}
+              note="先把目标说明清楚，再决定语言和资料来源。"
+              tone="sun"
+              icon={Target}
+            />
+            <WorkspaceMetricCard
+              label="课堂库存"
+              value={`${recentStages.length}`}
+              note="最近生成的课堂会继续显示在侧栏和回放区。"
+              tone="peach"
+              icon={BookOpenCheck}
+            />
           </div>
+        </WorkspaceHero>
+      </motion.div>
 
-          <div className="mt-5 space-y-5 border-t border-[#eee3d6] pt-5">
-            <label className="block">
-              <div className="mb-1.5 flex items-center justify-between">
-                <span className="workspace-label mb-0">学习主题</span>
-                <span className="text-xs font-medium text-[#938679]">{topicLength} 字</span>
-              </div>
-              <textarea
-                value={form.topic}
-                onChange={(event) => setForm((prev) => ({ ...prev, topic: event.target.value }))}
-                placeholder="例如：面向初二学生，用超市打折与路程变化案例讲解一次函数，并设计 2 个递进式互动问题。"
-                className="workspace-textarea min-h-[180px]"
-                rows={6}
-              />
-            </label>
+      <div className="flex flex-wrap gap-2.5">
+        {scenePills.map((pill, index) => (
+          <span
+            key={pill}
+            className={cn(
+              'inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold shadow-[0_10px_22px_rgba(96,93,107,0.08)]',
+              index === 0
+                ? 'border-[#252a33] bg-[#252a33] text-white'
+                : 'border-[#eadfce] bg-white/88 text-[#6b675f]',
+            )}
+          >
+            <span
+              className={cn(
+                'h-1.5 w-1.5 rounded-full',
+                index === 0 ? 'bg-[#f8d08f]' : 'bg-[#b7bfce]',
+              )}
+            />
+            {pill}
+          </span>
+        ))}
+      </div>
 
-            <div>
-              <p className="mb-2 text-xs font-semibold tracking-[0.18em] text-[#8b7864]">推荐写法</p>
-              <div className="flex flex-wrap gap-2">
-                {topicTemplates.map((template) => (
-                  <button
-                    key={template}
-                    type="button"
-                    onClick={() => setForm((prev) => ({ ...prev, topic: template }))}
-                    className="rounded-full border border-[#e0d3c2] bg-[#f8f2ea] px-3 py-1.5 text-xs font-medium text-[#62574c] transition-colors hover:border-[#cdb08d] hover:bg-[#f4eadf] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c7aa84]"
-                  >
-                    {template}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="grid gap-4 border-t border-[#eee3d6] pt-4 md:grid-cols-2">
-              <label className="block">
-                <span className="mb-1.5 inline-flex items-center gap-1.5 text-sm font-medium text-[#4a413a]">
-                  <Languages className="h-3.5 w-3.5" />
-                  输出语言
-                </span>
-                <select
-                  value={form.language}
-                  onChange={(event) =>
-                    setForm((prev) => ({
-                      ...prev,
-                      language: event.target.value as 'zh-CN' | 'en-US',
-                    }))
-                  }
-                  className="workspace-input h-11"
-                >
-                  <option value="zh-CN">中文</option>
-                  <option value="en-US">英文</option>
-                </select>
-              </label>
-
-              <div className="block">
-                <span className="mb-1.5 inline-flex text-sm font-medium text-[#4a413a]">参考资料</span>
-                <div className="relative">
-                  <input
-                    id="lesson-reference-pdf"
-                    type="file"
-                    accept="application/pdf"
-                    className="peer sr-only"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0] ?? null;
-                      setForm((prev) => ({ ...prev, pdfFile: file }));
-                    }}
+      <div className="grid gap-4 xl:grid-cols-[1.28fr_0.92fr]">
+        <motion.div
+          initial={{ opacity: 0, y: 22 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.05 }}
+        >
+          <WorkspacePanel
+            title="课堂配置台"
+            subtitle="左侧输入真实需求，右侧给你快速起步模板和生成流程。卡片背景与页面舞台分离之后，输入区和辅助区的层级会更清楚。"
+            icon={Wand2}
+            tone="sun"
+            className="min-h-[600px]"
+          >
+            <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+              <div className="space-y-4">
+                <label className="block">
+                  <span className="mb-2 block text-sm font-semibold text-[#3f4a60]">学习主题</span>
+                  <textarea
+                    value={form.topic}
+                    onChange={(event) =>
+                      setForm((prev) => ({ ...prev, topic: event.target.value }))
+                    }
+                    placeholder="例如：初二数学一次函数，先讲概念，再做2道基础题和1道提升题。"
+                    className="min-h-[260px] w-full resize-none rounded-[1.7rem] border border-[#dfd4c5] bg-white/92 px-4 py-4 text-sm leading-7 text-[#2a3345] outline-none transition focus:border-[#93b6ff] focus:ring-4 focus:ring-[#93b6ff]/15"
                   />
-                  <label htmlFor="lesson-reference-pdf" className="workspace-upload-label h-11">
-                    <FileUp className="h-4 w-4 shrink-0" />
-                    <span className="truncate">{form.pdfFile?.name ?? '上传课堂参考 PDF（可选）'}</span>
+                </label>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="rounded-[1.35rem] border border-[#ddd5f7] bg-white/84 p-4 shadow-[0_16px_34px_rgba(89,90,110,0.06)]">
+                    <span className="mb-2 flex items-center gap-2 text-sm font-semibold text-[#444e62]">
+                      <Languages className="h-4 w-4 text-[#64748b]" />
+                      输出语言
+                    </span>
+                    <select
+                      value={form.language}
+                      onChange={(event) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          language: event.target.value as FormState['language'],
+                        }))
+                      }
+                      className="h-11 w-full rounded-xl border border-[#e7def9] bg-[#faf8ff] px-3 text-sm text-[#44516b] outline-none"
+                    >
+                      <option value="zh-CN">中文</option>
+                      <option value="en-US">English</option>
+                    </select>
+                  </label>
+
+                  <label className="rounded-[1.35rem] border border-[#d5e8dc] bg-white/84 p-4 shadow-[0_16px_34px_rgba(89,90,110,0.06)]">
+                    <span className="mb-2 flex items-center gap-2 text-sm font-semibold text-[#444e62]">
+                      <Search className="h-4 w-4 text-[#64748b]" />
+                      搜索策略
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm((prev) => ({ ...prev, withWebSearch: !prev.withWebSearch }))
+                      }
+                      className={cn(
+                        'flex h-11 w-full items-center justify-between rounded-xl border px-3 text-sm font-semibold transition',
+                        form.withWebSearch
+                          ? 'border-[#d4efe5] bg-[#eefaf5] text-[#2f6d5c]'
+                          : 'border-[#e9e1d8] bg-[#fbf8f3] text-[#806f61]',
+                      )}
+                    >
+                      <span>{form.withWebSearch ? '已开启联网搜索' : '当前仅使用本地输入'}</span>
+                      <span
+                        className={cn(
+                          'h-2.5 w-2.5 rounded-full',
+                          form.withWebSearch ? 'bg-[#4ac39d]' : 'bg-[#d2b899]',
+                        )}
+                      />
+                    </button>
                   </label>
                 </div>
-              </div>
-            </div>
 
-            <div className="workspace-setting-row">
-              <div>
-                <p className="font-semibold text-[#3d342c]">启用网页搜索</p>
-                <p className="mt-1 text-sm text-[#7d7164]">补充更新的案例、新闻素材和背景信息。</p>
-              </div>
-              <input
-                type="checkbox"
-                checked={form.withWebSearch}
-                onChange={(event) =>
-                  setForm((prev) => ({ ...prev, withWebSearch: event.target.checked }))
-                }
-                className="h-4 w-4 rounded border-[#cdbba4] text-[#8b653a]"
-              />
-            </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-[#d9e4ff] bg-white/90 px-4 py-2 text-sm font-semibold text-[#50627e] shadow-[0_12px_30px_rgba(94,97,111,0.06)]">
+                    <FileUp className="h-4 w-4" />
+                    {form.pdfFile ? form.pdfFile.name : '上传 PDF 作为参考资料'}
+                    <input
+                      type="file"
+                      accept=".pdf"
+                      className="hidden"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) {
+                          setForm((prev) => ({ ...prev, pdfFile: file }));
+                        }
+                      }}
+                    />
+                  </label>
 
-            {error ? <p className="text-sm font-medium text-rose-600">{error}</p> : null}
-
-            <button
-              type="button"
-              onClick={handleGenerateLesson}
-              disabled={submitting}
-              className="workspace-primary-btn h-12 w-full"
-            >
-              {submitting ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  正在准备课堂内容
-                </>
-              ) : (
-                <>
-                  开始生成互动课堂
-                  <ArrowRight className="h-4 w-4" />
-                </>
-              )}
-            </button>
-          </div>
-        </motion.section>
-
-        <motion.section
-          initial={{ opacity: 0, y: 24 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.15, duration: 0.36 }}
-          className="space-y-5"
-        >
-          <div className="workspace-panel p-5">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-[#26201b]">最近课堂</h2>
-              <BookOpen className="h-4 w-4 text-[#7b6550]" />
-            </div>
-
-            <div className="mt-4 space-y-3">
-              {recentStages.length ? (
-                recentStages.map((stage) => (
-                  <Link key={stage.id} href={`/workspace/classroom/${stage.id}`} className="workspace-list-item">
-                    <p className="text-sm font-semibold text-[#3d352e]">{stage.name}</p>
-                    <p className="mt-1 text-xs text-[#7a7067]">
-                      {stage.sceneCount} 个场景 ·{' '}
-                      {new Intl.DateTimeFormat('zh-CN', {
-                        month: 'numeric',
-                        day: 'numeric',
-                      }).format(new Date(stage.updatedAt))}
-                    </p>
-                  </Link>
-                ))
-              ) : (
-                <div className="workspace-empty-box">还没有历史课堂，生成后会自动出现在这里。</div>
-              )}
-            </div>
-          </div>
-
-          <div className="workspace-panel p-5">
-            <h3 className="text-lg font-semibold text-[#26201b]">本次会生成</h3>
-            <div className="mt-3 space-y-2 border-t border-[#ede3d6] pt-3">
-              {outputHighlights.map((item) => (
-                <div key={item} className="flex items-start gap-2.5 py-2.5">
-                  <span className="mt-2 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[#9b7449]" />
-                  <p className="text-sm leading-7 text-[#4f463f]">{item}</p>
+                  <div className="inline-flex items-center gap-2 rounded-full border border-[#f0e0cf] bg-white/80 px-4 py-2 text-sm text-[#7b6b5c]">
+                    <Clock3 className="h-4 w-4" />
+                    预计生成耗时 10-20 秒
+                  </div>
                 </div>
-              ))}
-            </div>
-          </div>
 
-          <div className="workspace-panel p-5">
-            <p className="text-xs font-semibold tracking-[0.18em] text-[#8b7864]">小提示</p>
-            <p className="mt-2 text-base font-semibold text-[#2d251f]">
-              先写“学生是谁、要学会什么、希望课堂怎么展开”，再写素材要求。
-            </p>
-            <p className="mt-2 text-sm leading-7 text-[#776b5f]">
-              这种写法比只写一个知识点更容易生成出层次清楚、节奏稳定的课堂结构。
-            </p>
-          </div>
-        </motion.section>
+                {error ? <p className="text-sm font-medium text-[#cc4a43]">{error}</p> : null}
+
+                <button
+                  type="button"
+                  onClick={handleGenerateLesson}
+                  disabled={submitting || topicLength === 0}
+                  className="inline-flex h-12 items-center justify-center gap-2 rounded-[1.2rem] bg-[#20232b] px-5 text-sm font-semibold text-white shadow-[0_18px_34px_rgba(31,35,43,0.18)] transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-55"
+                >
+                  {submitting ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      正在准备生成
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-4 w-4" />
+                      生成课堂
+                      <ArrowRight className="h-4 w-4" />
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <div className="rounded-[1.45rem] border border-white/75 bg-white/86 p-4 shadow-[0_16px_34px_rgba(89,90,110,0.06)]">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-[#9aa8bd]">
+                    一键示例
+                  </p>
+                  <div className="mt-4 space-y-3">
+                    {topicTemplates.map((template) => (
+                      <button
+                        key={template.title}
+                        type="button"
+                        onClick={() => setForm((prev) => ({ ...prev, topic: template.value }))}
+                        className={cn(
+                          'w-full rounded-[1.35rem] border p-4 text-left shadow-[0_16px_30px_rgba(89,90,110,0.06)] transition hover:-translate-y-0.5',
+                          workspaceToneClass(template.tone),
+                        )}
+                      >
+                        <p className="text-sm font-semibold text-[#222936]">{template.title}</p>
+                        <p className="mt-1 text-xs text-[#68788f]">{template.note}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-[1.45rem] border border-white/75 bg-[linear-gradient(145deg,rgba(255,255,255,0.88),rgba(244,247,255,0.82))] p-4 shadow-[0_16px_34px_rgba(89,90,110,0.06)]">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-[#9aa8bd]">
+                    生成流程
+                  </p>
+                  <div className="mt-4 space-y-3">
+                    {[
+                      '分析学习目标与难度',
+                      '结合资料与联网结果补充上下文',
+                      '进入生成预览并继续生成课堂',
+                    ].map((step, index) => (
+                      <div
+                        key={step}
+                        className="flex items-start gap-3 rounded-[1.2rem] border border-[#edf0f7] bg-white/86 px-3 py-3"
+                      >
+                        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#20232b] text-xs font-semibold text-white">
+                          {index + 1}
+                        </div>
+                        <p className="text-sm leading-6 text-[#4f5f78]">{step}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </WorkspacePanel>
+        </motion.div>
+
+        <div className="grid gap-4">
+          <motion.div
+            initial={{ opacity: 0, y: 22 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.08 }}
+          >
+            <WorkspaceProfilePanel
+              avatar={avatar}
+              nickname={nickname}
+              bio={bio}
+              tone="peach"
+              footer={
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="rounded-[1.15rem] border border-white/80 bg-white/84 px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#9aa8bd]">
+                      本周
+                    </p>
+                    <p className="mt-2 text-xl font-semibold text-[#1f2430]">
+                      {recentStages.length || 0}
+                    </p>
+                    <p className="mt-1 text-xs text-[#6c7a91]">已生成课堂</p>
+                  </div>
+                  <div className="rounded-[1.15rem] border border-white/80 bg-white/84 px-3 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#9aa8bd]">
+                      搜索
+                    </p>
+                    <p className="mt-2 text-xl font-semibold text-[#1f2430]">
+                      {form.withWebSearch ? 'ON' : 'OFF'}
+                    </p>
+                    <p className="mt-1 text-xs text-[#6c7a91]">资料补全模式</p>
+                  </div>
+                </div>
+              }
+            />
+          </motion.div>
+
+          <motion.div
+            initial={{ opacity: 0, y: 22 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.12 }}
+          >
+            <WorkspacePanel
+              title="最近生成轨迹"
+              subtitle="用更明确的条形图展示最近课堂数量，让页面不只是表单。"
+              icon={Clock3}
+              tone="violet"
+            >
+              <MiniBarChart values={activityBars.values} labels={activityBars.labels} />
+            </WorkspacePanel>
+          </motion.div>
+
+          <motion.div
+            initial={{ opacity: 0, y: 22 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.16 }}
+          >
+            <WorkspacePanel
+              title="继续学习"
+              subtitle="从最近生成的课堂继续进入，不需要重新组织输入。"
+              icon={BookOpenCheck}
+              tone="mint"
+            >
+              <div className="space-y-3">
+                {recentStages.length ? (
+                  recentStages.map((stage, index) => (
+                    <button
+                      key={stage.id}
+                      type="button"
+                      onClick={() => router.push(`/classroom/${stage.id}`)}
+                      className={cn(
+                        'w-full rounded-[1.35rem] border p-4 text-left shadow-[0_14px_30px_rgba(89,90,110,0.06)] transition hover:-translate-y-0.5',
+                        workspaceToneClass(index % 2 === 0 ? 'sky' : 'coral'),
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-[#222936]">
+                            {stage.name}
+                          </p>
+                          <p className="mt-1 text-xs text-[#6d7b91]">
+                            {stage.sceneCount} 个场景 ·{' '}
+                            {new Date(stage.updatedAt).toLocaleDateString('zh-CN')}
+                          </p>
+                        </div>
+                        <ArrowRight className="mt-0.5 h-4 w-4 shrink-0 text-[#6f7f9d]" />
+                      </div>
+                    </button>
+                  ))
+                ) : (
+                  <div className="workspace-empty-box">
+                    还没有课堂记录，先从左侧配置台生成第一节课。
+                  </div>
+                )}
+              </div>
+            </WorkspacePanel>
+          </motion.div>
+        </div>
       </div>
     </div>
   );

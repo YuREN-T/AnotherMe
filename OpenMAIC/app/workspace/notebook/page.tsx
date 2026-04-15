@@ -2,224 +2,340 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'motion/react';
-import { PlayCircle, Search, Trash2 } from 'lucide-react';
+import { BookOpen, FileText, Loader2, Search, Tag, TrendingUp } from 'lucide-react';
 import {
-  deleteNotebookRecord,
-  loadNotebookRecords,
-  type NotebookRecord,
-} from '@/lib/workspace/problem-notebook';
-import { shiftLocalDateKey, toLocalDateKey } from '@/lib/workspace/date-utils';
+  MiniBarChart,
+  WorkspaceHero,
+  WorkspaceMetricCard,
+  WorkspacePanel,
+  WorkspaceProfilePanel,
+  workspaceToneClass,
+} from '@/components/workspace/workspace-dashboard';
+import { useUserProfileStore } from '@/lib/store/user-profile';
+import { cn } from '@/lib/utils';
+
+interface NoteItem {
+  id: string;
+  title: string;
+  content: string;
+  subject: string;
+  tags: string[];
+  createdAt: number;
+}
+
+const NOTES_STORAGE_KEY = 'workspace:notebook:items';
+
+const LEGACY_MOCK_NOTE_TITLES = new Set(['一次函数笔记', '光合作用要点', '勾股定理总结']);
+
+function isNoteItem(value: unknown): value is NoteItem {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<NoteItem>;
+  return (
+    typeof item.id === 'string' &&
+    typeof item.title === 'string' &&
+    typeof item.content === 'string' &&
+    typeof item.subject === 'string' &&
+    Array.isArray(item.tags) &&
+    item.tags.every((tag) => typeof tag === 'string') &&
+    typeof item.createdAt === 'number'
+  );
+}
+
+function isLegacyMockNotes(items: NoteItem[]): boolean {
+  return items.length === 3 && items.every((item) => LEGACY_MOCK_NOTE_TITLES.has(item.title));
+}
 
 export default function NotebookPage() {
-  const [query, setQuery] = useState('');
-  const [records, setRecords] = useState<NotebookRecord[]>([]);
-
-  async function refreshNotebook() {
-    const nextRecords = await loadNotebookRecords();
-    setRecords(nextRecords);
-  }
+  const [notes, setNotes] = useState<NoteItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedSubject, setSelectedSubject] = useState<string>('all');
+  const avatar = useUserProfileStore((state) => state.avatar);
+  const nickname = useUserProfileStore((state) => state.nickname);
+  const bio = useUserProfileStore((state) => state.bio);
 
   useEffect(() => {
-    let mounted = true;
+    const saved = localStorage.getItem(NOTES_STORAGE_KEY);
+    const nextNotes = (() => {
+      if (!saved) return [];
 
-    loadNotebookRecords().then((nextRecords) => {
-      if (!mounted) return;
-      setRecords(nextRecords);
+      try {
+        const parsed = JSON.parse(saved);
+        const normalized = Array.isArray(parsed) ? parsed.filter(isNoteItem) : [];
+        if (isLegacyMockNotes(normalized)) {
+          localStorage.removeItem(NOTES_STORAGE_KEY);
+          return [];
+        }
+        return normalized;
+      } catch {
+        localStorage.removeItem(NOTES_STORAGE_KEY);
+        return [];
+      }
+    })();
+
+    const frame = window.requestAnimationFrame(() => {
+      setNotes(nextNotes);
+      setIsLoading(false);
     });
 
-    return () => {
-      mounted = false;
-    };
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
-  const filtered = useMemo(() => {
-    const keyword = query.trim().toLowerCase();
-    if (!keyword) return records;
+  useEffect(() => {
+    if (!isLoading) {
+      localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(notes));
+    }
+  }, [isLoading, notes]);
 
-    return records.filter((item) => {
-      const haystack = [item.question, item.explanation, ...(item.tags || [])]
-        .join(' ')
-        .toLowerCase();
-      return haystack.includes(keyword);
+  const subjects = useMemo(() => {
+    const allSubjects = notes.map((note) => note.subject);
+    return ['all', ...Array.from(new Set(allSubjects))];
+  }, [notes]);
+
+  const filteredNotes = useMemo(() => {
+    return notes.filter((note) => {
+      const matchesSearch =
+        searchQuery === '' ||
+        note.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        note.content.toLowerCase().includes(searchQuery.toLowerCase());
+      const matchesSubject = selectedSubject === 'all' || note.subject === selectedSubject;
+      return matchesSearch && matchesSubject;
     });
-  }, [query, records]);
+  }, [notes, searchQuery, selectedSubject]);
 
-  const tagStats = useMemo(() => {
-    const counter = new Map<string, number>();
-    for (const record of records) {
-      for (const tag of record.tags || []) {
-        const key = tag.trim();
-        if (!key) continue;
-        counter.set(key, (counter.get(key) || 0) + 1);
-      }
-    }
+  const subjectSummary = useMemo(() => {
+    return subjects
+      .filter((subject) => subject !== 'all')
+      .map((subject) => ({
+        label: subject,
+        count: notes.filter((note) => note.subject === subject).length,
+      }));
+  }, [notes, subjects]);
 
-    return Array.from(counter.entries())
-      .map(([tag, count]) => ({ tag, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10);
-  }, [records]);
+  const tagSummary = useMemo(() => {
+    const counts = new Map<string, number>();
+    notes
+      .flatMap((note) => note.tags)
+      .forEach((tag) => {
+        counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      });
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [notes]);
 
-  const learningCurve = useMemo(() => {
-    const days = 14;
-    const dayMap = new Map<string, number>();
-    const today = new Date();
+  function deleteNote(id: string) {
+    setNotes((prev) => prev.filter((note) => note.id !== id));
+  }
 
-    for (let i = days - 1; i >= 0; i--) {
-      dayMap.set(shiftLocalDateKey(today, -i), 0);
-    }
-
-    for (const record of records) {
-      const key = toLocalDateKey(record.createdAt);
-      if (dayMap.has(key)) {
-        dayMap.set(key, (dayMap.get(key) || 0) + 1);
-      }
-    }
-
-    return Array.from(dayMap.entries()).map(([date, count]) => ({ date, count }));
-  }, [records]);
-
-  const maxCurveCount = Math.max(...learningCurve.map((point) => point.count), 1);
-  const statusLabelMap: Record<string, string> = {
-    generated: '已生成',
-    processing: '处理中',
-  };
-
-  const getCurveHeightClass = (count: number) => {
-    const ratio = count / maxCurveCount;
-    if (ratio >= 0.9) return 'h-full';
-    if (ratio >= 0.8) return 'h-[88%]';
-    if (ratio >= 0.7) return 'h-[76%]';
-    if (ratio >= 0.6) return 'h-[64%]';
-    if (ratio >= 0.5) return 'h-[52%]';
-    if (ratio >= 0.4) return 'h-[40%]';
-    if (ratio >= 0.3) return 'h-[30%]';
-    if (ratio >= 0.2) return 'h-[22%]';
-    if (ratio >= 0.1) return 'h-[14%]';
-    return 'h-[6%]';
-  };
+  if (isLoading) {
+    return (
+      <div className="flex h-[50vh] items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-[#6d7a92]" />
+      </div>
+    );
+  }
 
   return (
-    <div className="workspace-cn-font space-y-6">
-      <motion.section
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.38 }}
-        className="workspace-hero-card"
-      >
-        <p className="workspace-eyebrow">错题本</p>
-        <h1 className="workspace-title">把拍过的题、生成过的讲解和复盘线索都沉淀下来。</h1>
-        <p className="workspace-subtitle">
-          这里不是简单的文件夹，而是你自己的题目资料库，可以按关键词、标签和时间重新回看。
-        </p>
-      </motion.section>
+    <div className="space-y-4">
+      <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }}>
+        <WorkspaceHero
+          eyebrow="Notebook Hub"
+          title="把错题本做成可检索、可观察的学习资料库。"
+          description="不再只是平铺列表，而是增加主题分布、标签热度和最近笔记卡片，让你一眼看到知识积累的结构。"
+          badges={[
+            `${notes.length} 条笔记`,
+            `${Math.max(subjects.length - 1, 0)} 个科目`,
+            `${tagSummary.length} 个标签`,
+          ]}
+          tone="sky"
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <WorkspaceMetricCard
+              label="检索结果"
+              value={`${filteredNotes.length}`}
+              note="搜索与科目筛选会同步更新下面的笔记列表。"
+              tone="mint"
+              icon={Search}
+            />
+            <WorkspaceMetricCard
+              label="知识沉淀"
+              value={`${tagSummary.length}`}
+              note="标签数量越清晰，复习时越容易找到薄弱点。"
+              tone="violet"
+              icon={Tag}
+            />
+          </div>
+        </WorkspaceHero>
+      </motion.div>
 
-      <section className="grid gap-4 xl:grid-cols-[1.2fr_1fr]">
-        <div className="workspace-panel">
-          <h2 className="text-base font-semibold text-[#2b241e]">近 14 天记录曲线</h2>
-          <p className="mt-1 text-xs text-[#7a6d61]">每天新增的题目记录数量</p>
-
-          <div className="mt-4 flex h-40 items-end gap-1.5 rounded-[1.2rem] border border-[#e7ddcf] bg-[#f8f2ea] px-3 py-2">
-            {learningCurve.map((point) => (
-              <div key={point.date} className="flex flex-1 flex-col items-center justify-end gap-1">
-                <div
-                  className={`w-full rounded-t-md bg-gradient-to-t from-[#8e6236] to-[#d4b18a] ${getCurveHeightClass(point.count)}`}
-                  title={`${point.date}: ${point.count}`}
-                />
-                <span className="text-[10px] text-[#7a6d61]">{point.date.slice(5)}</span>
+      <div className="grid gap-4 xl:grid-cols-[1.35fr_0.95fr]">
+        <motion.div
+          initial={{ opacity: 0, y: 22 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.05 }}
+        >
+          <WorkspacePanel
+            title="笔记索引"
+            subtitle="用更清晰的白底索引区承接搜索，再用 pastel 卡片承接内容，避免页面和卡片混成一片。"
+            icon={FileText}
+            tone="sun"
+            className="min-h-[560px]"
+          >
+            <div className="grid gap-4">
+              <div className="grid gap-3 md:grid-cols-[1fr_220px]">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8c99af]" />
+                  <input
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder="搜索标题、内容或关键知识点..."
+                    className="h-12 w-full rounded-[1.2rem] border border-[#dde6f3] bg-white/90 pl-11 pr-4 text-sm text-[#263247] outline-none transition focus:border-[#9cb9ff] focus:ring-4 focus:ring-[#9cb9ff]/15"
+                  />
+                </div>
+                <select
+                  aria-label="按科目筛选笔记"
+                  value={selectedSubject}
+                  onChange={(event) => setSelectedSubject(event.target.value)}
+                  className="h-12 rounded-[1.2rem] border border-[#ece2f9] bg-white/86 px-4 text-sm text-[#39465f] outline-none"
+                >
+                  <option value="all">全部科目</option>
+                  {subjects
+                    .filter((subject) => subject !== 'all')
+                    .map((subject) => (
+                      <option key={subject} value={subject}>
+                        {subject}
+                      </option>
+                    ))}
+                </select>
               </div>
-            ))}
-          </div>
-        </div>
 
-        <div className="workspace-panel">
-          <h2 className="text-base font-semibold text-[#2b241e]">标签热度</h2>
-          <p className="mt-1 text-xs text-[#7a6d61]">最常出现的题型与知识点</p>
-
-          <div className="mt-4 flex flex-wrap gap-2">
-            {tagStats.length ? (
-              tagStats.map((item) => (
-                <span key={item.tag} className="workspace-chip">
-                  {item.tag} · {item.count}
-                </span>
-              ))
-            ) : (
-              <div className="workspace-empty-box w-full">还没有标签，生成并保存记录后会逐渐形成你的知识地图。</div>
-            )}
-          </div>
-        </div>
-      </section>
-
-      <section className="workspace-panel">
-        <label className="workspace-input flex items-center gap-2">
-          <Search className="h-4 w-4 text-slate-400" />
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            className="w-full bg-transparent text-sm outline-none"
-            placeholder="按题目、讲解内容或标签搜索"
-          />
-        </label>
-
-        <div className="mt-4 grid gap-4 lg:grid-cols-2">
-          {filtered.length ? (
-            filtered.map((record) => (
-              <article key={record.id} className="workspace-note-card">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs tracking-[0.14em] text-[#9a8d7f]">
-                      {statusLabelMap[record.status] ?? record.status}
-                    </p>
-                    <h3 className="mt-1 text-sm font-semibold text-[#3c332b]">{record.question}</h3>
-                  </div>
-                  <button
-                    type="button"
-                    className="workspace-icon-btn"
-                    onClick={async () => {
-                      await deleteNotebookRecord(record.id);
-                      await refreshNotebook();
-                    }}
-                    aria-label="删除记录"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                </div>
-
-                {record.imageDataUrl ? (
-                  <img src={record.imageDataUrl} alt="题目" className="mt-3 h-32 w-full rounded-xl object-cover" />
-                ) : null}
-
-                <p className="mt-3 text-sm leading-7 text-[#6d6156]">{record.explanation}</p>
-
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {(record.tags || []).map((tag) => (
-                    <span key={`${record.id}-${tag}`} className="workspace-chip-muted">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-
-                <div className="mt-4 flex items-center justify-between text-xs text-[#7a6d61]">
-                  <span>{new Date(record.createdAt).toLocaleString('zh-CN')}</span>
-                  {record.videoUrl ? (
-                    <a
-                      href={record.videoUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1.5 font-semibold text-[#7a5d3e]"
+              <div className="grid max-h-[430px] gap-3 overflow-auto pr-1">
+                {filteredNotes.length ? (
+                  filteredNotes.map((note, index) => (
+                    <div
+                      key={note.id}
+                      className={cn(
+                        'rounded-[1.45rem] border p-4 shadow-[0_14px_30px_rgba(89,90,110,0.06)]',
+                        workspaceToneClass(
+                          index % 3 === 0 ? 'peach' : index % 3 === 1 ? 'violet' : 'teal',
+                        ),
+                      )}
                     >
-                      <PlayCircle className="h-4 w-4" />
-                      查看视频
-                    </a>
-                  ) : null}
-                </div>
-              </article>
-            ))
-          ) : (
-            <div className="workspace-empty-box lg:col-span-2">还没有找到记录，可以先去题目视频页面生成一条。</div>
-          )}
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="rounded-full border border-white/80 bg-white/88 px-2.5 py-1 text-[11px] font-semibold text-[#51627d]">
+                              {note.subject}
+                            </span>
+                            <span className="text-[11px] text-[#7c8aa1]">
+                              {new Date(note.createdAt).toLocaleDateString('zh-CN')}
+                            </span>
+                          </div>
+                          <p className="mt-3 text-base font-semibold text-[#212734]">
+                            {note.title}
+                          </p>
+                          <p className="mt-2 text-sm leading-7 text-[#5f6d84]">{note.content}</p>
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {note.tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="rounded-full border border-white/85 bg-white/86 px-2.5 py-1 text-[11px] font-semibold text-[#596a86]"
+                              >
+                                #{tag}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => deleteNote(note.id)}
+                          className="rounded-full border border-white/85 bg-white/80 px-3 py-1.5 text-xs font-semibold text-[#7b6c62] transition hover:bg-white"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="workspace-empty-box flex min-h-[240px] flex-col items-center justify-center gap-3 text-center">
+                    <BookOpen className="h-10 w-10 text-[#97a6bb]" />
+                    <div>
+                      <p className="font-semibold text-[#53627b]">没有找到符合条件的笔记</p>
+                      <p className="mt-1 text-sm text-[#74839a]">
+                        可以换个关键词，或者切回全部科目。
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </WorkspacePanel>
+        </motion.div>
+
+        <div className="grid gap-4">
+          <motion.div
+            initial={{ opacity: 0, y: 22 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.08 }}
+          >
+            <WorkspaceProfilePanel
+              avatar={avatar}
+              nickname={nickname}
+              bio={bio}
+              title="资料拥有者"
+              tone="peach"
+            />
+          </motion.div>
+
+          <motion.div
+            initial={{ opacity: 0, y: 22 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.12 }}
+          >
+            <WorkspacePanel
+              title="科目分布"
+              subtitle="通过柱状分布看出笔记集中在哪些学科，补薄弱项会更直观。"
+              icon={TrendingUp}
+              tone="mint"
+            >
+              <MiniBarChart
+                values={subjectSummary.map((item) => item.count || 1)}
+                labels={subjectSummary.map((item) => item.label)}
+              />
+            </WorkspacePanel>
+          </motion.div>
+
+          <motion.div
+            initial={{ opacity: 0, y: 22 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.16 }}
+          >
+            <WorkspacePanel
+              title="标签热度"
+              subtitle="保留了标签功能，但把它做成了更细致的组件分组。"
+              icon={Tag}
+              tone="violet"
+            >
+              <div className="flex flex-wrap gap-2">
+                {tagSummary.length ? (
+                  tagSummary.map(([tag, count], index) => (
+                    <span
+                      key={tag}
+                      className={cn(
+                        'rounded-full border px-3 py-2 text-xs font-semibold shadow-[0_12px_22px_rgba(89,90,110,0.05)]',
+                        workspaceToneClass(index % 2 === 0 ? 'sun' : 'rose'),
+                      )}
+                    >
+                      #{tag} · {count}
+                    </span>
+                  ))
+                ) : (
+                  <div className="workspace-empty-box w-full">还没有标签数据。</div>
+                )}
+              </div>
+            </WorkspacePanel>
+          </motion.div>
         </div>
-      </section>
+      </div>
     </div>
   );
 }

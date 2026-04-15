@@ -2,9 +2,8 @@
 
 import { useImperativeHandle, forwardRef, useRef, useCallback, useState, useMemo } from 'react';
 import type { SessionType } from '@/lib/types/chat';
-import type { LectureNoteEntry } from '@/lib/types/chat';
 import type { DiscussionRequest } from '@/components/roundtable';
-import type { Action, SpeechAction, DiscussionAction } from '@/lib/types/action';
+import type { Action } from '@/lib/types/action';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useStageStore } from '@/lib/store';
@@ -37,6 +36,7 @@ interface ChatAreaProps {
   /** When provided and returns true, StreamBuffer holds on the current text item after reveal. */
   shouldHoldAfterReveal?: () => { holding: boolean; segmentDone: number } | boolean;
   currentSceneId?: string | null;
+  stageId?: string | null;
 }
 
 export interface ChatAreaRef {
@@ -86,6 +86,7 @@ export const ChatArea = forwardRef<ChatAreaRef, ChatAreaProps>(
     ref,
   ) => {
     const { t } = useI18n();
+    const stageId = useStageStore((s) => s.stage?.id ?? null);
     const scenes = useStageStore((s) => s.scenes);
     const {
       sessions,
@@ -123,44 +124,6 @@ export const ChatArea = forwardRef<ChatAreaRef, ChatAreaProps>(
     const isDraggingRef = useRef(false);
     const [isDragging, setIsDragging] = useState(false);
     const bottomRef = useRef<HTMLDivElement>(null);
-
-    // Derive lecture notes directly from scenes — updates reactively as scenes stream in
-    // Preserves action order so spotlight/laser badges appear inline between speech texts
-    const lectureNotes: LectureNoteEntry[] = useMemo(
-      () =>
-        scenes
-          .filter((scene) => scene.actions && scene.actions.length > 0)
-          .map((scene) => ({
-            sceneId: scene.id,
-            sceneTitle: scene.title,
-            sceneOrder: scene.order,
-            items: scene
-              .actions!.filter(
-                (a) =>
-                  a.type === 'speech' ||
-                  a.type === 'spotlight' ||
-                  a.type === 'laser' ||
-                  a.type === 'play_video' ||
-                  a.type === 'discussion',
-              )
-              .map((a) => {
-                if (a.type === 'speech') {
-                  return {
-                    kind: 'speech' as const,
-                    text: (a as SpeechAction).text,
-                  };
-                }
-                return {
-                  kind: 'action' as const,
-                  type: a.type,
-                  label: a.type === 'discussion' ? (a as DiscussionAction).topic : undefined,
-                };
-              }),
-            completedAt: scene.updatedAt || scene.createdAt || 0,
-          }))
-          .sort((a, b) => a.sceneOrder - b.sceneOrder),
-      [scenes],
-    );
 
     // Filter out lecture sessions for the Chat tab
     const chatSessions = useMemo(() => sessions.filter((s) => s.type !== 'lecture'), [sessions]);
@@ -297,7 +260,11 @@ export const ChatArea = forwardRef<ChatAreaRef, ChatAreaProps>(
 
             {/* Notes Tab */}
             <TabsContent value="lecture" className="flex-1 overflow-hidden flex flex-col">
-              <LectureNotesView notes={lectureNotes} currentSceneId={currentSceneId} />
+              <LectureNotesView
+                scenes={scenes}
+                currentSceneId={currentSceneId}
+                stageId={stageId}
+              />
             </TabsContent>
 
             {/* Chat Tab */}

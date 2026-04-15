@@ -184,13 +184,13 @@ export default function ClassroomDetailPage() {
           {loading ? (
             <div className="flex-1 flex items-center justify-center bg-gray-50 dark:bg-gray-900">
               <div className="text-center text-muted-foreground">
-                <p>Loading classroom...</p>
+                <p>正在加载课堂...</p>
               </div>
             </div>
           ) : error ? (
             <div className="flex-1 flex items-center justify-center bg-gray-50 dark:bg-gray-900">
               <div className="text-center">
-                <p className="text-destructive mb-4">Error: {error}</p>
+                <p className="text-destructive mb-4">加载失败：{error}</p>
                 <button
                   onClick={() => {
                     setError(null);
@@ -199,7 +199,7 @@ export default function ClassroomDetailPage() {
                   }}
                   className="px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
                 >
-                  Retry
+                  重试
                 </button>
               </div>
             </div>

@@ -2,11 +2,13 @@ import unittest
 
 from agents.coordinate_scene import CoordinateSceneCompiler, CoordinateSceneError
 from agents.codegen import TemplateCodeGenerator
+from agents.geometry_fact_compiler import GeometryFactCompiler
 
 
 class CoordinateSceneCompilerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.compiler = CoordinateSceneCompiler()
+        self.fact_compiler = GeometryFactCompiler()
 
     def test_validate_coordinate_scene_resolves_reflected_point(self) -> None:
         coordinate_scene = {
@@ -133,6 +135,44 @@ class CoordinateSceneCompilerTests(unittest.TestCase):
         }
         with self.assertRaises(CoordinateSceneError):
             self.compiler.compile(geometry_spec=spec)
+
+    def test_fold_rhombus_geometry_preserves_prime_points_and_solves_axis_point(self) -> None:
+        facts = {
+            "points": ["A", "B", "C", "D", "E", "B′", "C′"],
+            "segments": ["AB", "BC", "CD", "DA", "DE", "EB", "EB′", "B′C′", "C′D"],
+            "polygons": ["ABCD", "AB′C′D"],
+            "angles": [{"vertex": "B", "sides": ["AB", "BC"], "name": "∠ABC"}],
+            "right_angles": [{"vertex": "E", "sides": ["EB", "EB′"], "label": "∠BEB′"}],
+            "relations": [
+                {"type": "point_on_segment", "point": "E", "segment": "AB"},
+                {"type": "parallel", "segments": ["AB", "CD"]},
+                {"type": "parallel", "segments": ["AD", "BC"]},
+            ],
+            "measurements": [
+                {"type": "length", "segment": "AD", "value": 5},
+                {"type": "angle", "vertex": "B", "value": "arctan(2)", "description": "tan∠ABC = 2"},
+            ],
+        }
+
+        geometry_spec = self.fact_compiler.compile(
+            facts,
+            problem_text="在菱形ABCD中，AD=5，tanB=2，E是AB上一点，将菱形ABCD沿DE折叠，使B、C的对应点分别是B′、C′，当∠BEB′=90°时",
+        )
+        normalized = self.compiler.normalize_geometry_spec(geometry_spec)
+        scene = self.compiler.compile(geometry_spec=normalized)
+        report = self.compiler.validate_coordinate_scene(scene)
+
+        self.assertTrue(report["is_valid"], report["failed_checks"])
+        point_lookup = {item["id"]: item["coord"] for item in report["resolved_scene"]["points"]}
+        self.assertIn("B1", point_lookup)
+        self.assertIn("C1", point_lookup)
+        self.assertIn("E", point_lookup)
+        self.assertTrue(0.0 < point_lookup["E"][0] < point_lookup["A"][0])
+
+    def test_parse_tangent_value_supports_fraction_notation(self) -> None:
+        self.assertAlmostEqual(self.compiler._parse_tangent_value("tan(∠ABC)=1/2"), 0.5)
+        self.assertAlmostEqual(self.compiler._parse_tangent_value("arctan(3/4)"), 0.75)
+        self.assertAlmostEqual(self.compiler._parse_tangent_value("tanB=2"), 2.0)
 
 
 class TemplateCodeGeneratorTests(unittest.TestCase):

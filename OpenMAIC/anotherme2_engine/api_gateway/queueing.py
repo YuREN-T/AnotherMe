@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional, Tuple
 
 import redis
+
+from .config import Settings
 
 
 @dataclass
@@ -46,3 +48,38 @@ class RedisQueueClient:
 
     def ping(self) -> bool:
         return bool(self.client.ping())
+
+
+class PollingQueueClient:
+    """DB-polling fallback queue for local development without Redis."""
+
+    backend = "polling"
+
+    def enqueue(self, queue_name: str, message: QueueMessage) -> None:
+        return None
+
+    def dequeue(self, queue_names: Iterable[str], timeout: int = 5) -> Optional[Tuple[str, QueueMessage]]:
+        return None
+
+    def push_dead_letter(self, dlq_name: str, message: QueueMessage) -> None:
+        return None
+
+    def ping(self) -> bool:
+        return False
+
+
+def build_queue_client(settings: Settings):
+    backend = getattr(settings, "queue_backend", "auto")
+    if backend == "polling":
+        return PollingQueueClient()
+
+    redis_client = RedisQueueClient(settings.redis_url)
+    if backend == "redis":
+        return redis_client
+
+    try:
+        if redis_client.ping():
+            return redis_client
+    except Exception:
+        pass
+    return PollingQueueClient()

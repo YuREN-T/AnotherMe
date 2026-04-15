@@ -1,3 +1,6 @@
+"""
+场景图更新器 - 根据步骤描述生成题图增量状态，保持对象引用稳定
+"""
 import copy
 import re
 from typing import Any, Dict, List, Optional, Set
@@ -11,11 +14,22 @@ class SceneGraphUpdater:
         base_scene_graph: Dict[str, Any],
         step: Any,
         step_index: int,
+        teaching_step: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """根据步骤描述生成题图增量状态，保持对象引用稳定。"""
         current_scene = copy.deepcopy(base_scene_graph or {})
-        focus_entities = self._extract_focus_entities(current_scene, step)
-        operations = self._infer_operations(step, focus_entities)
+        extracted_focus = self._extract_focus_entities(current_scene, step)
+        teaching_focus = self._collect_teaching_focus_targets(teaching_step)
+        focus_entities = self._merge_focus_targets(extracted_focus, teaching_focus)
+        operations: List[Dict[str, Any]] = []
+        operations.extend(
+            self._operations_from_teaching_actions(
+                teaching_step.get("actions", []) if isinstance(teaching_step, dict) else [],
+                focus_entities,
+            )
+        )
+        operations.extend(self._infer_operations(step, focus_entities))
+        operations = self._dedupe_operations(operations)
         current_scene = self._apply_operations(current_scene, operations, focus_entities, step_index)
 
         return {
@@ -122,6 +136,23 @@ class SceneGraphUpdater:
 
         # 折叠轴优先级：步骤显式提到的线段 -> AD -> AB -> 第一条可用线段
         axis_pairs: List[List[str]] = []
+        for op in operations:
+            if str(op.get("type", "")).strip().lower() != "transform":
+                continue
+            axis_hint = str(op.get("axis", "")).strip()
+            if not axis_hint:
+                continue
+            refs = _line_points(axis_hint)
+            if refs:
+                axis_pairs.append(refs)
+                continue
+            parsed = re.findall(r"[A-Za-z]\d*'?", axis_hint)
+            if len(parsed) >= 2:
+                axis_pairs.append([
+                    str(parsed[0]).strip(),
+                    str(parsed[1]).strip(),
+                ])
+
         line_ids = {
             str(item.get("id", ""))
             for item in lines
@@ -222,6 +253,123 @@ class SceneGraphUpdater:
                         matched.append(entity_id)
 
         return matched
+
+    def _collect_teaching_focus_targets(self, teaching_step: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(teaching_step, dict):
+            return []
+        targets = teaching_step.get("focus_targets") or []
+        return [str(item).strip() for item in targets if str(item).strip()]
+
+    def _merge_focus_targets(
+        self,
+        extracted_focus: List[str],
+        teaching_focus: List[str],
+    ) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for item in [*(teaching_focus or []), *(extracted_focus or [])]:
+            token = str(item).strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            merged.append(token)
+        return merged
+
+    def _operations_from_teaching_actions(
+        self,
+        actions: Any,
+        fallback_focus: List[str],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(actions, list):
+            return []
+
+        operations: List[Dict[str, Any]] = []
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            action_name = str(item.get("action", "")).strip().lower()
+            targets = [str(token).strip() for token in (item.get("targets") or fallback_focus or []) if str(token).strip()]
+
+            if action_name in {"show_original_figure", "maintain_scene"}:
+                operations.append(
+                    {
+                        "type": "maintain",
+                        "targets": targets,
+                        "reason": action_name,
+                    }
+                )
+                continue
+
+            if action_name in {"highlight_entity", "highlight_fold_axis", "highlight_relation"}:
+                if action_name == "highlight_fold_axis":
+                    axis = str(item.get("axis", "")).strip()
+                    targets = [axis] if axis else targets
+                operations.append(
+                    {
+                        "type": "highlight",
+                        "targets": targets,
+                    }
+                )
+                continue
+
+            if action_name in {"animate_fold", "create_image_point", "show_fold_invariants"}:
+                op_targets = targets or fallback_focus
+                op: Dict[str, Any] = {
+                    "type": "transform",
+                    "targets": op_targets,
+                    "mode": "fold",
+                }
+                axis = str(item.get("axis", "")).strip()
+                if axis:
+                    op["axis"] = axis
+                operations.append(op)
+                continue
+
+            if action_name in {
+                "draw_perpendicular_auxiliary",
+                "draw_connection_auxiliary",
+                "connect_center_tangent",
+            }:
+                mapped_targets = targets or fallback_focus
+                if str(item.get("from", "")).strip():
+                    mapped_targets = [str(item.get("from", "")).strip(), *mapped_targets]
+                if str(item.get("to", "")).strip():
+                    mapped_targets.append(str(item.get("to", "")).strip())
+                if str(item.get("to_line", "")).strip():
+                    mapped_targets.append(str(item.get("to_line", "")).strip())
+                operations.append(
+                    {
+                        "type": "label",
+                        "targets": [token for token in mapped_targets if token],
+                    }
+                )
+                continue
+
+        return operations
+
+    def _dedupe_operations(self, operations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique: List[Dict[str, Any]] = []
+        seen = set()
+        for item in operations:
+            op_type = str(item.get("type", "")).strip().lower()
+            mode = str(item.get("mode", "")).strip().lower()
+            axis = str(item.get("axis", "")).strip().lower()
+            targets = sorted(
+                {
+                    str(token).strip()
+                    for token in (item.get("targets") or [])
+                    if str(token).strip()
+                }
+            )
+            key = f"{op_type}|{mode}|{axis}|{','.join(targets)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            copied = copy.deepcopy(item)
+            if targets:
+                copied["targets"] = targets
+            unique.append(copied)
+        return unique
 
     def _infer_operations(self, step: Any, focus_entities: List[str]) -> List[Dict[str, Any]]:
         """根据步骤文本和视觉提示，推断可能的动画操作类型，保持与题图对象引用一致。"""

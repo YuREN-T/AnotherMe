@@ -1,5 +1,5 @@
 import { redirect } from 'next/navigation';
 
-export default function WorkspaceIndexPage() {
+export default function StudentWorkspaceIndexPage() {
   redirect('/workspace/interactive');
 }
